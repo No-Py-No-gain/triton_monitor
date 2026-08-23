@@ -19,6 +19,10 @@ from triton_telemetry import (
 
 logger = setup_triton_logging()
 
+# Blindaje de consola Windows: cp1252 no puede codificar los glifos del pipeline forense
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 def build_cli_parser() -> argparse.ArgumentParser:
     """Configura el analizador CLI oficial conforme a las reglas UPATECO."""
     parser = argparse.ArgumentParser(
@@ -95,7 +99,7 @@ async def async_main():
         # Captura Quirúrgica 1: Tiempos de espera de proveedores agotados
         logger.error(f"\n ANOMALÍA: DETECTADOS TIMEOUTS EN PROVEEDORES CLOUD ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
-            logger.error(f"   Fallo: {exc}")
+            logger.error(f"   Fallo: {exc}", exc_info=exc)
             # Mostrar notas de diagnóstico dinámico (add_note)
             for note in getattr(exc, "__notes__", []):
                 logger.error(f"     └─ [FORENSE TRITÓN] {note}")
@@ -104,7 +108,7 @@ async def async_main():
         # Captura Quirúrgica 2: Fallos físicos de red (e.g. 504 Gateway Timeout o caídas de ruteo)
         logger.error(f"\n ANOMALÍA: DETECTADOS FALLOS FÍSICOS DE CONEXIÓN O ROUTING ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
-            logger.error(f"   Fallo: {exc}")
+            logger.error(f"   Fallo: {exc}", exc_info=exc)
             for note in getattr(exc, "__notes__", []):
                 logger.error(f"     └─ [FORENSE TRITÓN] {note}")
                 
@@ -112,7 +116,7 @@ async def async_main():
         # Captura Quirúrgica 3: Formato corrupto o paridad inconsistente
         logger.error(f"\n  ADVERTENCIA: RECIBIDOS PAYLOADS DE TELEMETRÍA CORRUPTOS ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
-            logger.error(f"   Fallo: {exc}")
+            logger.error(f"   Fallo: {exc}", exc_info=exc)
             for note in getattr(exc, "__notes__", []):
                 logger.error(f"     └─ [FORENSE TRITÓN] {note}")
                 
@@ -120,7 +124,7 @@ async def async_main():
         # Captura Quirúrgica 4: Fallos genéricos de Tritón no catalogados
         logger.error(f"\n DETECTADO ERROR OPERACIONAL IMPREVISTO EN ECOSISTEMA TRITÓN:")
         for exc in group.exceptions:
-            logger.error(f"   Fallo: {exc}")
+            logger.error(f"   Fallo: {exc}", exc_info=exc)
 
     finally:
         # PEP 765 / Python 3.14: finally solo se usa para liberar descriptores y hilos

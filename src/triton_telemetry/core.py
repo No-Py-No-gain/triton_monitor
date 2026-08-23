@@ -1,116 +1,235 @@
 # Lógica asíncrona de consulta HTTP (asyncio + httpx)
-# Descripcion: Lógica concurrente asíncrona de red. Utiliza httpx.AsyncClient acoplado a un asyncio.TaskGroup para paralelizar peticiones reales a internet e intercepta errores lógicos/timeouts mapeándolos forensemente.
+# Descripcion: Lógica concurrente asíncrona de red. Implementa las tres corrutinas nominales
+# de proveedores cloud (posts 1, 2 y 3 de JSONPlaceholder), los gatillos de caos real contra
+# HttpBin (timeout y estatus HTTP erróneos) y el orquestador asyncio.TaskGroup que paraleliza
+# todo, mapeando cada error nativo de httpx hacia una excepción semántica Tritón mediante
+# encadenamiento explícito (raise ... from) y notas forenses con add_note().
 
 # src/triton_telemetry/core.py
 import asyncio
-import logging
 import json
+import logging
+from typing import Any, Awaitable, Callable, Dict, List, Union
+
 import httpx
-from typing import Any, Dict
-from .exceptions import ProviderTimeoutError, CorruptedPayloadError, NetworkPeeringError
+
+from .exceptions import (
+    CorruptedPayloadError,
+    NetworkPeeringError,
+    ProviderTimeoutError,
+    TritonError,
+)
 
 logger = logging.getLogger("triton_monitor")
 
-# Mapeo de proveedores reales de prueba (endpoints estables de JSONPlaceholder)
+# ---------------------------------------------------------------------------
+# Consumo nominal real: un endpoint estable por proveedor (JSONPlaceholder)
+# ---------------------------------------------------------------------------
 PROVIDER_ENDPOINTS = {
     "AWS": "https://jsonplaceholder.typicode.com/posts/1",
     "Azure": "https://jsonplaceholder.typicode.com/posts/2",
-    "GCP": "https://jsonplaceholder.typicode.com/posts/3"
+    "GCP": "https://jsonplaceholder.typicode.com/posts/3",
 }
 
-# Endpoints especiales para inyección de Caos real (vía HttpBin)
-CHAOS_ENDPOINTS = {
-    "TIMEOUT_TRIGGER": "https://httpbin.org/delay/3",    # Provoca retardo real de 3 segundos
-    "BAD_GATEWAY_TRIGGER": "https://httpbin.org/status/504", # Provoca código real 504
-    "CORRUPTED_TRIGGER": "https://httpbin.org/xml"       # Provoca datos XML cuando esperamos JSON
+# ---------------------------------------------------------------------------
+# Endpoints de inyección de Caos real (HttpBin)
+# ---------------------------------------------------------------------------
+TIMEOUT_TRIGGER_URL = "https://httpbin.org/delay/3"             # Retardo controlado real de 3 segundos
+GATEWAY_TIMEOUT_TRIGGER_URL = "https://httpbin.org/status/504"  # Estatus HTTP 504 (Gateway Timeout)
+UNPROCESSABLE_TRIGGER_URL = "https://httpbin.org/status/422"    # Estatus HTTP 422 (Unprocessable Entity)
+
+# Contexto forense estandarizado para auditoría (visible vía __notes__)
+TIMEOUT_FORENSIC_NOTE = "Timeout superado en el nodo de telemetría de respaldo"
+UNEXPECTED_STATUS_MESSAGE = "Estatus HTTP no esperado recibido"
+
+
+async def _execute_telemetry_exchange(
+    client: httpx.AsyncClient,
+    provider: str,
+    url: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    """
+    Núcleo compartido de intercambio HTTP: ejecuta el GET asíncrono y traduce
+    cada error nativo de httpx a su excepción semántica Tritón correspondiente.
+
+    El encadenamiento explícito (raise ... from) preserva intacto el traceback
+    de la causa raíz original para la auditoría forense posterior.
+    """
+    logger.debug(
+        f"Petición asíncrona iniciada hacia {provider}: {url}",
+        extra={"provider": provider},
+    )
+
+    try:
+        response = await client.get(url, timeout=timeout)
+        # Dispara httpx.HTTPStatusError si el servidor devuelve 4xx/5xx
+        response.raise_for_status()
+        payload = response.json()
+
+    except httpx.TimeoutException as native_error:
+        # Gatillo de timeout real: se re-lanza encadenado como ProviderTimeoutError
+        semantic_error = ProviderTimeoutError(
+            f"Se agotó el tiempo de espera ({timeout}s) consultando a {provider}."
+        )
+        semantic_error.add_note(TIMEOUT_FORENSIC_NOTE)
+        semantic_error.add_note(f"Provider_ID: {provider} | Límite_CLI: {timeout}s | Endpoint: {url}")
+        raise semantic_error from native_error
+
+    except httpx.HTTPStatusError as native_error:
+        # Estatus HTTP erróneo: se re-lanza encadenado como CorruptedPayloadError
+        semantic_error = CorruptedPayloadError(UNEXPECTED_STATUS_MESSAGE)
+        semantic_error.add_note(
+            f"Provider_ID: {provider} | HTTP_Status_Code: {native_error.response.status_code}"
+        )
+        raise semantic_error from native_error
+
+    except (json.JSONDecodeError, ValueError) as native_error:
+        # Payload recibido pero no serializable a JSON estructurado
+        raise CorruptedPayloadError(
+            f"El proveedor {provider} devolvió un payload no serializable o con errores de paridad."
+        ) from native_error
+
+    except httpx.RequestError as native_error:
+        # Caída física de transporte: DNS, ruteo, conexión rechazada, etc.
+        semantic_error = NetworkPeeringError(
+            f"Fallo físico de transporte o ruteo al intentar alcanzar {provider}."
+        )
+        semantic_error.add_note(f"Provider_ID: {provider} | Native_Error_Type: {type(native_error).__name__}")
+        raise semantic_error from native_error
+
+    if not isinstance(payload, dict):
+        # Contrato de telemetría violado: el JSON es válido pero no es el objeto esperado
+        raise CorruptedPayloadError(
+            f"El proveedor {provider} devolvió un JSON válido pero fuera del contrato (tipo: {type(payload).__name__})."
+        )
+
+    logger.info(
+        f"Telemetría recibida exitosamente de {provider}.",
+        extra={"provider": provider, "status_code": response.status_code},
+    )
+    return {
+        "provider": provider,
+        "status": "NOMINAL",
+        "latency_sec": response.elapsed.total_seconds(),
+        "payload_id": payload.get("id", -1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Requisito 1: Las tres corrutinas de red asíncronas (consumo nominal real)
+# ---------------------------------------------------------------------------
+async def query_aws_status(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Corrutina nominal de AWS: consulta el post 1 de JSONPlaceholder."""
+    return await _execute_telemetry_exchange(client, "AWS", PROVIDER_ENDPOINTS["AWS"], timeout)
+
+
+async def query_azure_status(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Corrutina nominal de Azure: consulta el post 2 de JSONPlaceholder."""
+    return await _execute_telemetry_exchange(client, "Azure", PROVIDER_ENDPOINTS["Azure"], timeout)
+
+
+async def query_gcp_status(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Corrutina nominal de GCP: consulta el post 3 de JSONPlaceholder."""
+    return await _execute_telemetry_exchange(client, "GCP", PROVIDER_ENDPOINTS["GCP"], timeout)
+
+
+# ---------------------------------------------------------------------------
+# Requisitos 2 y 3: Gatillos de inyección de fallos reales en producción
+# ---------------------------------------------------------------------------
+async def trigger_timeout_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Gatillo de timeout real: /delay/3 tarda 3s en responder, de modo que un límite
+    CLI inferior (ej. --timeout 1.0) dispara un httpx.TimeoutException genuino, que se
+    captura y re-lanza encadenado como ProviderTimeoutError con nota forense dinámica."""
+    return await _execute_telemetry_exchange(client, "AWS", TIMEOUT_TRIGGER_URL, timeout)
+
+
+async def trigger_gateway_timeout_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Gatillo de estatus erróneo 504: response.raise_for_status() eleva el
+    httpx.HTTPStatusError nativo, re-lanzado como CorruptedPayloadError encadenado."""
+    return await _execute_telemetry_exchange(client, "Azure", GATEWAY_TIMEOUT_TRIGGER_URL, timeout)
+
+
+async def trigger_unprocessable_entity_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Gatillo de estatus erróneo 422: valida la misma cadena de resiliencia ante
+    Unprocessable Entity manteniendo íntegro el traceback de la causa raíz."""
+    return await _execute_telemetry_exchange(client, "GCP", UNPROCESSABLE_TRIGGER_URL, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Registro de misiones: selecciona la corrutina según modo operativo
+# ---------------------------------------------------------------------------
+TelemetryMission = Callable[[httpx.AsyncClient, float], Awaitable[Dict[str, Any]]]
+
+NOMINAL_MISSIONS: Dict[str, TelemetryMission] = {
+    "AWS": query_aws_status,
+    "Azure": query_azure_status,
+    "GCP": query_gcp_status,
+}
+
+CHAOS_MISSIONS: Dict[str, TelemetryMission] = {
+    "AWS": trigger_timeout_scenario,
+    "Azure": trigger_gateway_timeout_scenario,
+    "GCP": trigger_unprocessable_entity_scenario,
 }
 
 
-async def query_provider_telemetry(provider: str, timeout: float, use_chaos: bool = False) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Requisito 4: Orquestación asíncrona mediante asyncio.TaskGroup
+# ---------------------------------------------------------------------------
+MissionOutcome = Union[Dict[str, Any], TritonError]
+
+
+async def _run_mission_with_capture(
+    mission: TelemetryMission,
+    client: httpx.AsyncClient,
+    provider: str,
+    timeout: float,
+) -> MissionOutcome:
     """
-    Consulta la API de telemetría del proveedor de forma asíncrona usando httpx.
-    Soporta inyección de caos realista para validar la resiliencia del sistema.
+    Red de seguridad de continuidad operativa: aísla el fallo de cada proveedor
+    para que una anomalía NO cancele a las tareas hermanas del TaskGroup
+    (semántica fail-fast nativa). Devuelve el dict nominal o la excepción
+    semántica ya encadenada como sentinela de incidente.
     """
-    # Determinar el endpoint basado en el modo
-    if use_chaos:
-        if provider == "AWS":
-            url = CHAOS_ENDPOINTS["TIMEOUT_TRIGGER"]
-        elif provider == "Azure":
-            url = CHAOS_ENDPOINTS["BAD_GATEWAY_TRIGGER"]
-        else:
-            url = CHAOS_ENDPOINTS["CORRUPTED_TRIGGER"]
-    else:
-        url = PROVIDER_ENDPOINTS.get(provider, "https://jsonplaceholder.typicode.com/posts/1")
-
-    logger.debug(f"Petición asíncrona iniciada hacia {provider} en URL: {url}", extra={"provider": provider})
-
-    # Usamos httpx.AsyncClient con control de timeouts estrictos
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, timeout=timeout)
-            
-            # Lanzará HTTPStatusError si el código es 4xx o 5xx
-            response.raise_for_status()
-            
-            # Intento de parseo JSON estructurado
-            try:
-                data = response.json()
-                logger.info(f"Telemetría recibida exitosamente de {provider}", extra={"provider": provider, "status_code": response.status_code})
-                return {
-                    "provider": provider,
-                    "status": "NOMINAL",
-                    "latency_sec": response.elapsed.total_seconds(),
-                    "payload_id": data.get("id", -1)
-                }
-            except (json.JSONDecodeError, ValueError) as err:
-                # Lanzar excepción semántica con encadenamiento
-                raise CorruptedPayloadError(
-                    f"El proveedor {provider} devolvió un payload no serializable o con errores de paridad."
-                ) from err
-                
-        except httpx.TimeoutException as err:
-            # Capturar timeouts nativos y relanzar semánticos agregándole notas de contexto
-            p_err = ProviderTimeoutError(f"Se agotó el tiempo de espera ({timeout}s) al conectar con {provider}.")
-            p_err.add_note(f"Provider_ID: {provider}")
-            p_err.add_note(f"Requested_Timeout_Limit: {timeout}s")
-            p_err.add_note(f"Target_Endpoint: {url}")
-            raise p_err from err
-            
-        except httpx.HTTPStatusError as err:
-            # Capturar respuestas erróneas de servidor y relanzar con metadatos
-            n_err = NetworkPeeringError(f"Fallo de conexión o denegación de ruteo de {provider}. Estatus HTTP: {err.response.status_code}.")
-            n_err.add_note(f"Provider_ID: {provider}")
-            n_err.add_note(f"HTTP_Status_Code: {err.response.status_code}")
-            raise n_err from err
-            
-        except httpx.RequestError as err:
-            # Caída física o de red genérica (offline, dns fallido, etc.)
-            n_err = NetworkPeeringError(f"Error crítico de transporte de red al intentar alcanzar {provider}.")
-            n_err.add_note(f"Provider_ID: {provider}")
-            n_err.add_note(f"Network_Error_Type: {type(err).__name__}")
-            raise n_err from err
+    try:
+        return await mission(client, timeout)
+    except TritonError as semantic_error:
+        logger.error(f"Incidente registrado en {provider}: {semantic_error}")
+        return semantic_error
 
 
-async def scan_all_providers(providers: list[str], timeout: float, use_chaos: bool = False) -> list[Dict[str, Any]]:
+async def scan_all_providers(
+    providers: list[str],
+    timeout: float,
+    use_chaos: bool = False,
+) -> list[Dict[str, Any]]:
     """
-    Orquesta las llamadas paralelas utilizando la estructura asyncio.TaskGroup.
-    Todas las excepciones arrojadas por las tareas se agruparán en un ExceptionGroup nativo.
-    """
-    tasks = []
-    results = []
+    Coordina la ejecución paralela y simultánea de las corrutinas de telemetría
+    dentro de un bloque async with asyncio.TaskGroup(), compartiendo un único
+    httpx.AsyncClient entre todas las tareas.
 
-    # El TaskGroup encapsula el ciclo de vida de la ejecución concurrente
-    async with asyncio.TaskGroup() as tg:
-        for provider in providers:
-            # Asignamos nombres individuales a las tareas para facilitar la trazabilidad en logs
-            task = tg.create_task(
-                query_provider_telemetry(provider, timeout, use_chaos),
-                name=f"Task-{provider}"
-            )
-            tasks.append(task)
-            
-    # Si la ejecución asíncrona es exitosa, colectamos los resultados de las tareas
-    for task in tasks:
-        results.append(task.result())
-        
-    return results
+    Tras completar TODAS las tareas (sin cancelaciones cruzadas), si existieron
+    incidentes se re-elevan agrupados en un ExceptionGroup nativo, listo para la
+    captura quirúrgica con except* en la capa de presentación (app_operator).
+    """
+    mission_registry = CHAOS_MISSIONS if use_chaos else NOMINAL_MISSIONS
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with asyncio.TaskGroup() as task_group:
+            tasks = [
+                task_group.create_task(
+                    _run_mission_with_capture(mission_registry[provider], client, provider, timeout),
+                    name=f"TritonTask-{provider}",
+                )
+                for provider in providers
+            ]
+
+    outcomes: List[MissionOutcome] = [task.result() for task in tasks]
+    incidents = [outcome for outcome in outcomes if isinstance(outcome, TritonError)]
+
+    if incidents:
+        # Reconstrucción del ExceptionGroup con el inventario COMPLETO de fallos concurrentes
+        raise ExceptionGroup("Incidentes de telemetría detectados por TaskGroup", incidents)
+
+    return [outcome for outcome in outcomes if not isinstance(outcome, TritonError)]
