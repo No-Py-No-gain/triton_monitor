@@ -65,12 +65,41 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Modo de operación del despachador de telemetría."
     )
 
+    # Grupo opcional mutuamente excluyente: salida de texto a stdout (sys.stdout)
+    # --verbose y --quiet no pueden coexistir; controlan el nivel del handler consola.
+    output_group = parser.add_mutually_exclusive_group(required=False)
+    output_group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Salida detallada a stdout: incluye notas forenses y registros DEBUG."
+    )
+    output_group.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Salida mínima a stdout: solo WARNING y errores críticos."
+    )
+
     return parser
 
 
 async def async_main():
     parser = build_cli_parser()
     args = parser.parse_args()
+
+    # Ajuste dinámico del nivel del handler stdout (sys.stdout) según grupo excluyente.
+    # El dictConfig deja stdout_console en INFO por defecto; aquí lo refinamos en runtime.
+    # El handler real vive dentro del QueueListener (logger.handlers solo tiene el
+    # QueueHandler de desacople no bloqueante), por eso accedemos via logger.listener.
+    if hasattr(logger, "listener") and logger.listener:
+        for h in logger.listener.handlers:
+            # Identificar el handler de consola (StreamHandler puro, no FileHandler)
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                if args.verbose:
+                    h.setLevel(logging.DEBUG)
+                elif args.quiet:
+                    h.setLevel(logging.WARNING)
+                # else: se respeta el nivel INFO por defecto del dictConfig
+                break  # stdout_console es único
 
     logger.info("=" * 64)
     logger.info(f"  INICIANDO MONITOREO MULTICLOUD: PROYECTO TRITÓN")
@@ -92,7 +121,7 @@ async def async_main():
             logger.info(f"  • {r['provider']} -> Latencia de Red: {r['latency_sec']:.3f}s | ID de Evento: {r['payload_id']} | Estado: {r['status']}")
             
     except* ProviderTimeoutError as group:
-        # Captura Quirúrgica 1: Tiempos de espera de proveedores agotados
+        # Captura Quirúrgica 1: Tiempos de espera de proveedores agotados (timeout real de la API)
         logger.error(f"\n ANOMALÍA: DETECTADOS TIMEOUTS EN PROVEEDORES CLOUD ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
             logger.error(f"   Fallo: {exc}")
@@ -100,17 +129,17 @@ async def async_main():
             for note in getattr(exc, "__notes__", []):
                 logger.error(f"     └─ [FORENSE TRITÓN] {note}")
                 
-    except* NetworkPeeringError as group:
-        # Captura Quirúrgica 2: Fallos físicos de red (e.g. 504 Gateway Timeout o caídas de ruteo)
-        logger.error(f"\n ANOMALÍA: DETECTADOS FALLOS FÍSICOS DE CONEXIÓN O ROUTING ({len(group.exceptions)} incidentes):")
+    except* CorruptedPayloadError as group:
+        # Captura Quirúrgica 2: Mitigar códigos de error HTTP de forma lógica sin detener el programa
+        logger.error(f"\n  ADVERTENCIA: RECIBIDOS PAYLOADS DE TELEMETRÍA CORRUPTOS ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
             logger.error(f"   Fallo: {exc}")
             for note in getattr(exc, "__notes__", []):
                 logger.error(f"     └─ [FORENSE TRITÓN] {note}")
                 
-    except* CorruptedPayloadError as group:
-        # Captura Quirúrgica 3: Formato corrupto o paridad inconsistente
-        logger.error(f"\n  ADVERTENCIA: RECIBIDOS PAYLOADS DE TELEMETRÍA CORRUPTOS ({len(group.exceptions)} incidentes):")
+    except* NetworkPeeringError as group:
+        # Captura Quirúrgica 3: Fallos catastróficos de DNS/conexión cuando el host no tiene internet
+        logger.error(f"\n ANOMALÍA: DETECTADOS FALLOS FÍSICOS DE CONEXIÓN O ROUTING ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
             logger.error(f"   Fallo: {exc}")
             for note in getattr(exc, "__notes__", []):
