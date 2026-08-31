@@ -1,1 +1,2 @@
 # Dependencias aisladas del proyecto (debe incluir 'httpx')
+httpx>=0.27
