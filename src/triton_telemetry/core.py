@@ -9,6 +9,9 @@
 import asyncio
 import json
 import logging
+# FIX 1: faltaban Callable, Awaitable, List y Union — el módulo no cargaba
+# (NameError) apenas Python intentaba interpretar las anotaciones de tipo
+# más abajo (TelemetryMission, MissionOutcome, outcomes: List[...]).
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
 import httpx
@@ -17,14 +20,15 @@ from .exceptions import (
     CorruptedPayloadError,
     NetworkPeeringError,
     ProviderTimeoutError,
-    TritonError,
+    TritonError,           # se importa además de las subclases para poder
+                            # capturar "cualquier incidente Tritón" de forma
+                            # genérica en _run_mission_with_capture()
 )
 
-logger = logging.getLogger("triton_monitor")
+logger = logging.getLogger("triton_monitor")  # logger central de la app_operator
 
-# ---------------------------------------------------------------------------
+
 # Consumo nominal real: un endpoint estable por proveedor (JSONPlaceholder)
-# ---------------------------------------------------------------------------
 PROVIDER_ENDPOINTS = {
     "AWS": "https://jsonplaceholder.typicode.com/posts/1",
     "Azure": "https://jsonplaceholder.typicode.com/posts/2",
@@ -62,36 +66,57 @@ async def _execute_telemetry_exchange(
     )
 
     try:
+        # await client.get(...) libera el event loop mientras espera la
+        # respuesta: otras tareas del TaskGroup pueden avanzar mientras tanto.
         response = await client.get(url, timeout=timeout)
-        # Dispara httpx.HTTPStatusError si el servidor devuelve 4xx/5xx
+
+        # raise_for_status() convierte cualquier 4xx/5xx en httpx.HTTPStatusError,
+        # así lo podemos capturar y traducir más abajo en vez de seguir de largo
+        # con una respuesta inválida.
         response.raise_for_status()
         payload = response.json()
 
     except httpx.TimeoutException as native_error:
-        # Gatillo de timeout real: se re-lanza encadenado como ProviderTimeoutError
+        # Se disparó porque el servidor tardó más que `timeout` (caso real:
+        # TIMEOUT_TRIGGER_URL tarda 3s fijos). Se traduce a una excepción
+        # propia del dominio Tritón en vez de dejar filtrar el tipo de httpx.
         semantic_error = ProviderTimeoutError(
             f"Se agotó el tiempo de espera ({timeout}s) consultando a {provider}."
         )
+        # add_note() adjunta contexto extra sin pisar el mensaje original,
+        # útil para logs/auditoría posterior sin perder la excepción base.
         semantic_error.add_note(TIMEOUT_FORENSIC_NOTE)
         semantic_error.add_note(f"Provider_ID: {provider} | Límite_CLI: {timeout}s | Endpoint: {url}")
+        # "raise ... from native_error" encadena la excepción: el traceback
+        # muestra la causa real de httpx, no solo la semántica de Tritón.
         raise semantic_error from native_error
 
     except httpx.HTTPStatusError as native_error:
-        # Estatus HTTP erróneo: se re-lanza encadenado como CorruptedPayloadError
-        semantic_error = CorruptedPayloadError(UNEXPECTED_STATUS_MESSAGE)
+        # FIX 2: un 504/422 es un problema de RED/SERVIDOR, no de payload
+        # corrupto — antes esto mapeaba (mal) a CorruptedPayloadError y
+        # mezclaba dos causas distintas bajo la misma excepción semántica.
+        # Ahora coincide con el criterio usado en el resto del proyecto:
+        # fallas de transporte/estatus HTTP -> NetworkPeeringError.
+        semantic_error = NetworkPeeringError(
+            f"El proveedor {provider} respondió con un error HTTP: "
+            f"{native_error.response.status_code}."
+        )
         semantic_error.add_note(
             f"Provider_ID: {provider} | HTTP_Status_Code: {native_error.response.status_code}"
         )
         raise semantic_error from native_error
 
     except (json.JSONDecodeError, ValueError) as native_error:
-        # Payload recibido pero no serializable a JSON estructurado
+        # JSONDecodeError hereda de ValueError, por eso alcanza con capturar
+        # ambos en un solo except: cubre "no vino JSON" y "vino JSON mal
+        # formado" con el mismo tratamiento.
         raise CorruptedPayloadError(
             f"El proveedor {provider} devolvió un payload no serializable o con errores de paridad."
         ) from native_error
 
     except httpx.RequestError as native_error:
-        # Caída física de transporte: DNS, ruteo, conexión rechazada, etc.
+        # Cubre fallas de transporte antes de siquiera recibir una respuesta:
+        # DNS caído, conexión rechazada, problemas de ruteo, etc.
         semantic_error = NetworkPeeringError(
             f"Fallo físico de transporte o ruteo al intentar alcanzar {provider}."
         )
@@ -99,7 +124,8 @@ async def _execute_telemetry_exchange(
         raise semantic_error from native_error
 
     if not isinstance(payload, dict):
-        # Contrato de telemetría violado: el JSON es válido pero no es el objeto esperado
+        # JSON válido no implica estructura válida: por ejemplo [1, 2, 3]
+        # parsea bien pero no tiene .get(), y rompería la línea de abajo.
         raise CorruptedPayloadError(
             f"El proveedor {provider} devolvió un JSON válido pero fuera del contrato (tipo: {type(payload).__name__})."
         )
@@ -111,6 +137,8 @@ async def _execute_telemetry_exchange(
     return {
         "provider": provider,
         "status": "NOMINAL",
+        # response.elapsed ya trae la duración medida por httpx: más preciso
+        # y prolijo que tomar el tiempo manualmente con el loop.
         "latency_sec": response.elapsed.total_seconds(),
         "payload_id": payload.get("id", -1),
     }
@@ -146,7 +174,7 @@ async def trigger_timeout_scenario(client: httpx.AsyncClient, timeout: float) ->
 
 async def trigger_gateway_timeout_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
     """Gatillo de estatus erróneo 504: response.raise_for_status() eleva el
-    httpx.HTTPStatusError nativo, re-lanzado como CorruptedPayloadError encadenado."""
+    httpx.HTTPStatusError nativo, re-lanzado como NetworkPeeringError encadenado."""
     return await _execute_telemetry_exchange(client, "Azure", GATEWAY_TIMEOUT_TRIGGER_URL, timeout)
 
 
@@ -159,14 +187,21 @@ async def trigger_unprocessable_entity_scenario(client: httpx.AsyncClient, timeo
 # ---------------------------------------------------------------------------
 # Registro de misiones: selecciona la corrutina según modo operativo
 # ---------------------------------------------------------------------------
+# Alias de tipo: una "misión" es cualquier corrutina que toma (client, timeout)
+# y devuelve eventualmente un dict de telemetría. Sirve para tipar los
+# diccionarios de abajo sin repetir la firma completa cada vez.
 TelemetryMission = Callable[[httpx.AsyncClient, float], Awaitable[Dict[str, Any]]]
 
+# Registro nominal: qué corrutina "real" corresponde a cada proveedor.
 NOMINAL_MISSIONS: Dict[str, TelemetryMission] = {
     "AWS": query_aws_status,
     "Azure": query_azure_status,
     "GCP": query_gcp_status,
 }
 
+# Registro de caos: mismo shape que el de arriba pero apuntando a los
+# gatillos de fallo. Permite elegir el diccionario completo con un solo
+# booleano (use_chaos) en vez de un if/else por proveedor.
 CHAOS_MISSIONS: Dict[str, TelemetryMission] = {
     "AWS": trigger_timeout_scenario,
     "Azure": trigger_gateway_timeout_scenario,
@@ -177,6 +212,8 @@ CHAOS_MISSIONS: Dict[str, TelemetryMission] = {
 # ---------------------------------------------------------------------------
 # Requisito 4: Orquestación asíncrona mediante asyncio.TaskGroup
 # ---------------------------------------------------------------------------
+# El resultado de una misión puede ser el dict nominal o, si falló, la propia
+# excepción semántica ya capturada (en vez de dejarla explotar sin control).
 MissionOutcome = Union[Dict[str, Any], TritonError]
 
 
@@ -195,6 +232,10 @@ async def _run_mission_with_capture(
     try:
         return await mission(client, timeout)
     except TritonError as semantic_error:
+        # Clave del wrapper: en vez de dejar que la excepción se propague
+        # dentro del TaskGroup (lo que cancelaría las demás tareas por el
+        # comportamiento fail-fast nativo), la atrapamos acá y la devolvemos
+        # como un valor más. Así todas las tareas llegan a completarse.
         logger.error(f"Incidente registrado en {provider}: {semantic_error}")
         return semantic_error
 
@@ -213,23 +254,34 @@ async def scan_all_providers(
     incidentes se re-elevan agrupados en un ExceptionGroup nativo, listo para la
     captura quirúrgica con except* en la capa de presentación (app_operator).
     """
+    # Selecciona de una sola vez el diccionario de corrutinas a usar según el
+    # modo (nominal vs. caos), evitando ramificar la lógica en cada proveedor.
     mission_registry = CHAOS_MISSIONS if use_chaos else NOMINAL_MISSIONS
 
+    # Un solo AsyncClient compartido por todas las tareas: reutiliza el pool
+    # de conexiones en vez de abrir/cerrar una conexión por request.
     async with httpx.AsyncClient(follow_redirects=True) as client:
         async with asyncio.TaskGroup() as task_group:
             tasks = [
                 task_group.create_task(
+                    # Se llama siempre a través del wrapper _run_mission_with_capture,
+                    # nunca a la misión "pelada" — así ningún proveedor caído
+                    # tumba a los demás.
                     _run_mission_with_capture(mission_registry[provider], client, provider, timeout),
                     name=f"TritonTask-{provider}",
                 )
                 for provider in providers
             ]
 
+    # Acá ya salimos del "async with TaskGroup()", así que todas las tareas
+    # terminaron (con éxito o con incidente capturado) — es seguro leer .result().
     outcomes: List[MissionOutcome] = [task.result() for task in tasks]
     incidents = [outcome for outcome in outcomes if isinstance(outcome, TritonError)]
 
     if incidents:
-        # Reconstrucción del ExceptionGroup con el inventario COMPLETO de fallos concurrentes
+        # Empaqueta TODOS los incidentes juntos (no solo el primero) en un
+        # ExceptionGroup nativo de Python 3.11+, pensado para capturarse
+        # selectivamente más arriba con "except*".
         raise ExceptionGroup("Incidentes de telemetría detectados por TaskGroup", incidents)
 
     return [outcome for outcome in outcomes if not isinstance(outcome, TritonError)]
