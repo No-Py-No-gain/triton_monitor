@@ -1,16 +1,33 @@
-# Formateador JSON avanzado y pipeline asincrono no bloqueante
-#
-# Responsabilidad:
-# - Formatear LogRecord como JSON estructurado.
-# - Serializar excepciones y ExceptionGroup de forma recursiva.
-# - Preservar notes y causas encadenadas.
-# - Desacoplar el logging mediante QueueHandler + QueueListener.
-# - Rotar archivos al alcanzar 2 MiB.
-# - Mantener como máximo 3 archivos históricos.
-# - Comprimir automáticamente los históricos mediante gzip.
+# src/triton_telemetry/logging_engine.py
+
+"""
+Motor de logging estructurado y asíncrono del Proyecto Tritón.
+
+Responsabilidades:
+- Formatear LogRecord como JSON estructurado.
+- Serializar excepciones y ExceptionGroup de forma recursiva.
+- Preservar notes, causas y contextos encadenados.
+- Desacoplar el logging mediante QueueHandler + QueueListener.
+- Rotar archivos al alcanzar 2 MiB.
+- Mantener como máximo 3 archivos históricos.
+- Comprimir automáticamente los históricos mediante GZIP.
+
+Integrante 3:
+    - AsyncJSONFormatter.
+    - Serialización recursiva de ExceptionGroup.
+    - Conservación de causas (__cause__) y notas (__notes__).
+    - Mapeo dinámico de metadata de LogRecord y extra={...}.
+
+Integrante 4:
+    - QueueHandler + QueueListener.
+    - RotatingFileHandler.
+    - Rotación de archivos.
+    - Compresión GZIP.
+"""
 
 from __future__ import annotations
 
+import copy
 import gzip
 import json
 import logging
@@ -57,7 +74,7 @@ def gzip_namer(name: str) -> str:
 
 def gzip_rotator(source: str, dest: str) -> None:
     """
-    Comprime el archivo rotado a formato gzip.
+    Comprime el archivo rotado a formato GZIP.
 
     La compresión se realiza primero sobre un archivo temporal.
     El archivo definitivo se reemplaza de forma atómica.
@@ -80,8 +97,8 @@ def gzip_rotator(source: str, dest: str) -> None:
         # ----------------------------------------------------
         # Crear archivo temporal en el mismo directorio.
         #
-        # Esto permite que os.replace() sea atómico en el
-        # mismo sistema de archivos.
+        # Esto permite que os.replace() sea atómico dentro
+        # del mismo sistema de archivos.
         # ----------------------------------------------------
 
         fd, temp_name = tempfile.mkstemp(
@@ -112,8 +129,6 @@ def gzip_rotator(source: str, dest: str) -> None:
 
         # ----------------------------------------------------
         # Reemplazo atómico.
-        #
-        # El .tmp pasa a ser el .gz definitivo.
         # ----------------------------------------------------
 
         os.replace(
@@ -124,16 +139,17 @@ def gzip_rotator(source: str, dest: str) -> None:
         temporary_path = None
 
         # ----------------------------------------------------
-        # El original se elimina SOLO después de que el gzip
+        # El original se elimina SOLO después de que el GZIP
         # fue creado correctamente.
         # ----------------------------------------------------
 
         source_path.unlink()
 
     except Exception:
+
         # ----------------------------------------------------
-        # Si algo falla, intentamos eliminar solamente el
-        # temporal. El archivo original permanece intacto.
+        # Si algo falla, eliminamos solamente el temporal.
+        # El archivo original permanece intacto.
         # ----------------------------------------------------
 
         if temporary_path is not None:
@@ -145,6 +161,37 @@ def gzip_rotator(source: str, dest: str) -> None:
                 pass
 
         raise
+
+
+# ============================================================
+# QUEUE HANDLER
+# ============================================================
+
+class PreservingQueueHandler(logging.handlers.QueueHandler):
+    """
+    QueueHandler que conserva la información de excepciones.
+
+    QueueHandler.prepare() normalmente prepara el LogRecord
+    antes de colocarlo en la cola y puede eliminar exc_info.
+
+    AsyncJSONFormatter necesita exc_info para construir:
+
+        - exception_tree
+        - stack_trace
+
+    Como el proyecto utiliza queue.Queue dentro del mismo
+    proceso, podemos conservar esos objetos.
+
+    Se devuelve una copia del LogRecord para no modificar
+    el registro original.
+    """
+
+    def prepare(
+        self,
+        record: logging.LogRecord,
+    ) -> logging.LogRecord:
+
+        return copy.copy(record)
 
 
 # ============================================================
@@ -194,9 +241,11 @@ class AsyncJSONFormatter(logging.Formatter):
 
         if notes:
             exception_data["notes"] = list(notes)
+        else:
+            exception_data["notes"] = []
 
         # ----------------------------------------------------
-        # ExceptionGroup
+        # ExceptionGroup / BaseExceptionGroup
         # ----------------------------------------------------
 
         if isinstance(
@@ -215,6 +264,7 @@ class AsyncJSONFormatter(logging.Formatter):
         # ----------------------------------------------------
 
         if exc.__cause__ is not None:
+
             exception_data["cause"] = (
                 self._serialize_exception(
                     exc.__cause__
@@ -231,6 +281,7 @@ class AsyncJSONFormatter(logging.Formatter):
             exc.__context__ is not None
             and not exc.__suppress_context__
         ):
+
             exception_data["context_exception"] = (
                 self._serialize_exception(
                     exc.__context__
@@ -304,36 +355,58 @@ class AsyncJSONFormatter(logging.Formatter):
             tz=timezone.utc,
         )
 
+        task_name = getattr(
+            record,
+            "taskName",
+            None,
+        )
+
         payload: dict[str, Any] = {
             "timestamp": (
-                dt_utc.isoformat()
+                dt_utc
+                .isoformat()
+                .replace("+00:00", "Z")
             ),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "task_name": getattr(
-                record,
-                "taskName",
-                None,
-            ),
+            "process": record.process,
             "thread_name": record.threadName,
-            "async_task": getattr(record, "taskName", None),
+            "task_name": task_name,
+
+            # Se conserva también async_task por compatibilidad
+            # con la implementación original del formatter.
+            "async_task": task_name,
+
             "filename": record.filename,
             "line": record.lineno,
         }
 
         # ----------------------------------------------------
-        # Excepción
+        # Excepciones
         # ----------------------------------------------------
 
         if record.exc_info:
+
             _, exc_value, _ = record.exc_info
 
             if exc_value is not None:
-                payload["exception"] = (
+
+                serialized_exception = (
                     self._serialize_exception(
                         exc_value
                     )
+                )
+
+                # Nombre usado por la nueva implementación.
+                payload["exception"] = (
+                    serialized_exception
+                )
+
+                # Nombre utilizado originalmente por
+                # AsyncJSONFormatter.
+                payload["exception_tree"] = (
+                    serialized_exception
                 )
 
                 payload["stack_trace"] = (
@@ -343,7 +416,7 @@ class AsyncJSONFormatter(logging.Formatter):
                 )
 
         # ----------------------------------------------------
-        # Campos personalizados enviados mediante extra={}
+        # Campos internos estándar de LogRecord
         # ----------------------------------------------------
 
         reserved_fields = {
@@ -369,7 +442,12 @@ class AsyncJSONFormatter(logging.Formatter):
             "process",
             "message",
             "taskName",
+            "asctime",
         }
+
+        # ----------------------------------------------------
+        # Campos personalizados enviados mediante extra={}
+        # ----------------------------------------------------
 
         for key, value in record.__dict__.items():
 
@@ -377,9 +455,16 @@ class AsyncJSONFormatter(logging.Formatter):
                 key not in reserved_fields
                 and not key.startswith("_")
             ):
+
                 payload[key] = (
-                    self._serialize_value(value)
+                    self._serialize_value(
+                        value
+                    )
                 )
+
+        # ----------------------------------------------------
+        # Conversión final a JSON
+        # ----------------------------------------------------
 
         return json.dumps(
             payload,
@@ -401,24 +486,24 @@ def setup_triton_logging(
     Arquitectura:
 
         Logger
-            |
-            v
-        QueueHandler
-            |
-            v
-        queue.Queue
-            |
-            v
-        QueueListener
-            |
-            v
-        AsyncJSONFormatter
-            |
-            v
-        RotatingFileHandler
-            |
-            v
-        gzip
+          |
+          v
+    PreservingQueueHandler
+          |
+          v
+      queue.Queue
+          |
+          v
+     QueueListener
+       /       \
+      v         v
+   Consola   RotatingFileHandler
+                  |
+                  v
+          AsyncJSONFormatter
+                  |
+                  v
+                GZIP
     """
 
     # --------------------------------------------------------
@@ -439,7 +524,7 @@ def setup_triton_logging(
         return existing_logger
 
     # --------------------------------------------------------
-    # Configuración declarativa.
+    # Configuración declarativa
     # --------------------------------------------------------
 
     logging_schema = {
@@ -447,6 +532,7 @@ def setup_triton_logging(
         "disable_existing_loggers": False,
 
         "formatters": {
+
             "json_structured": {
                 "()": AsyncJSONFormatter,
             },
@@ -463,6 +549,7 @@ def setup_triton_logging(
         },
 
         "handlers": {
+
             "stdout_console": {
                 "class": "logging.StreamHandler",
                 "level": "INFO",
@@ -477,27 +564,33 @@ def setup_triton_logging(
                 ),
                 "level": "DEBUG",
                 "formatter": "json_structured",
+
                 "filename": log_filename,
+
                 "maxBytes": MAX_LOG_BYTES,
                 "backupCount": BACKUP_COUNT,
+
                 "encoding": "utf-8",
             },
         },
 
         "loggers": {
+
             LOGGER_NAME: {
                 "level": "DEBUG",
+
                 "handlers": [
                     "stdout_console",
                     "rotating_file",
                 ],
+
                 "propagate": False,
             },
         },
     }
 
     # --------------------------------------------------------
-    # Aplicar configuración.
+    # Aplicar configuración
     # --------------------------------------------------------
 
     logging.config.dictConfig(
@@ -509,13 +602,15 @@ def setup_triton_logging(
     )
 
     # --------------------------------------------------------
-    # Buscar el RotatingFileHandler configurado.
+    # Buscar RotatingFileHandler configurado
     # --------------------------------------------------------
 
     file_handler = next(
         (
             handler
+
             for handler in logger.handlers
+
             if isinstance(
                 handler,
                 logging.handlers.RotatingFileHandler,
@@ -525,13 +620,14 @@ def setup_triton_logging(
     )
 
     if file_handler is None:
+
         raise RuntimeError(
             "No se pudo encontrar "
             "el RotatingFileHandler"
         )
 
     # --------------------------------------------------------
-    # Inyectar callbacks de gzip.
+    # Inyectar callbacks de GZIP
     # --------------------------------------------------------
 
     file_handler.namer = gzip_namer
@@ -551,13 +647,16 @@ def setup_triton_logging(
     )
 
     # --------------------------------------------------------
-    # QueueHandler:
+    # QueueHandler
     #
-    # El logger deja el LogRecord en memoria.
+    # IMPORTANTE:
+    #
+    # Se utiliza PreservingQueueHandler para que exc_info
+    # llegue intacto al AsyncJSONFormatter.
     # --------------------------------------------------------
 
     queue_handler = (
-        logging.handlers.QueueHandler(
+        PreservingQueueHandler(
             log_queue
         )
     )
@@ -567,9 +666,9 @@ def setup_triton_logging(
     )
 
     # --------------------------------------------------------
-    # Guardamos los handlers físicos originales.
+    # Guardar handlers físicos originales.
     #
-    # El QueueListener será el encargado de utilizarlos.
+    # QueueListener será el encargado de utilizarlos.
     # --------------------------------------------------------
 
     real_handlers = list(
@@ -577,10 +676,7 @@ def setup_triton_logging(
     )
 
     # --------------------------------------------------------
-    # QueueListener:
-    #
-    # Un hilo secundario consume la cola y ejecuta los
-    # handlers físicos.
+    # QueueListener
     # --------------------------------------------------------
 
     listener = (
@@ -594,7 +690,7 @@ def setup_triton_logging(
     # --------------------------------------------------------
     # El logger deja de escribir directamente.
     #
-    # Ahora solamente entrega LogRecords al QueueHandler.
+    # Ahora solamente entrega LogRecords a la cola.
     # --------------------------------------------------------
 
     logger.handlers = [
@@ -602,14 +698,16 @@ def setup_triton_logging(
     ]
 
     # --------------------------------------------------------
-    # Arrancar el hilo consumidor.
+    # Arrancar hilo consumidor
     # --------------------------------------------------------
 
     listener.start()
 
     # --------------------------------------------------------
-    # Guardamos referencias para permitir que app_operator.py
-    # pueda detener correctamente el listener.
+    # Guardar referencias.
+    #
+    # Esto permite que otros módulos puedan detener
+    # correctamente el listener.
     # --------------------------------------------------------
 
     logger.listener = listener
