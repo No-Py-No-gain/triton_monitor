@@ -26,6 +26,8 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+.atl/
+docs/
 
 # OS files
 .DS_Store
