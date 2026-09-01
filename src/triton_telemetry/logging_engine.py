@@ -317,6 +317,7 @@ class AsyncJSONFormatter(logging.Formatter):
                 None,
             ),
             "thread_name": record.threadName,
+            "async_task": getattr(record, "taskName", None),
             "filename": record.filename,
             "line": record.lineno,
         }
