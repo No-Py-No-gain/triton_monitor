@@ -15,16 +15,24 @@ functions usable from other tooling.
 
 Design notes
 ------------
-* ``exception_tree`` and ``stack_trace`` are OPTIONAL. The current
-  ``app_operator.py`` logs ``except*`` outcomes via ``logger.error(...)`` with
-  no ``exc_info``, so the formatter never emits those fields; the forensic
-  notes ("Provider_ID: ...", "HTTP_Status_Code: ...") instead live inside the
-  ``message`` text. This validator scans ``message`` for status codes and
-  notes so it stays useful on real logs, while still fully validating the
-  documented ``exception_tree`` shape when it IS present (e.g. after a future
-  fix that passes ``exc_info``).
-* ``asctime`` is an extra field that leaks from the console formatter into the
-  JSON payload; it is reported as metadata but NOT required.
+* ``exception_tree`` and ``stack_trace`` are OPTIONAL in general but NORMAL
+  on the ``except*`` ERROR entries. ``app_operator.py`` passes ``exc_info=exc``
+  when logging each incident of the group (since commit bc9e097), and
+  ``PreservingQueueHandler.prepare()`` (PR #5, commit bdd3c0e) keeps that
+  ``exc_info`` alive across the logging queue, so the recursive exception
+  tree DOES reach the JSON payload — the formatter emits it under both the
+  ``exception`` and ``exception_tree`` keys (the unification is tracked as
+  issue I-16 and must land together with this validator). They stay optional
+  here because only the ``except*`` ERROR entries carry them (INFO/DEBUG
+  records and the wrapper's "Incidente registrado ..." ERROR records never
+  do); when present, the documented shape is fully validated below. The
+  ``message`` scan for status codes / forensic notes is kept as
+  defense-in-depth and for historical (pre-PR #5) logs whose trees did not
+  survive the queue.
+* ``asctime`` no longer leaks into the JSON: PR #5 added it to the
+  formatter's ``reserved_fields`` (logging_engine.py), so current runs emit
+  zero ``asctime`` keys. The counter below only fires on historical
+  (pre-PR #5) logs and is reported as metadata, never required.
 
 Exit codes: 0 if every entry is valid and gzip decompression is intact,
            1 if any violation or corruption is found (or no logs found).
@@ -55,6 +63,16 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 )
 VALID_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
+# ``async_task`` mirrors ``LogRecord.taskName``, which only exists from
+# Python 3.12 (CPython gh-97263). On 3.11 — the documented minimum — the
+# formatter emits ``task_name``/``async_task`` as null, so demanding a
+# non-empty value there would flag EVERY entry as invalid and flip the whole
+# log's verdict to FALLO. The field must still be PRESENT on every
+# interpreter; only its non-emptiness is enforced from 3.12 onwards
+# (issue I-18, option a — the key name itself stays as-is because the
+# formatter/validator key unification is issue I-16, another lane).
+_TASK_KEY_MUST_BE_NON_EMPTY = sys.version_info >= (3, 12)
+
 ACTIVE_LOG_NAME = "triton_services.log"
 
 # A 3-digit HTTP status (100-599). Word-bounded so "id 200" style tokens in
@@ -64,7 +82,13 @@ _HTTP_STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
 _HTTP_STATUS_NOTE_RE = re.compile(r"HTTP_Status_Code:\s*(\d{3})", re.IGNORECASE)
 # Spanish narrative form used by app_operator.py: "Estatus HTTP: 504."
 _ESTATUS_HTTP_RE = re.compile(r"Estatus\s*HTTP:?\s*(\d{3})", re.IGNORECASE)
-_HTTP_VERB_RE = re.compile(r"\bGET\b")
+# HTTP verb evidence (issue I-20). httpx >= 0.28 dropped the trailing verb
+# from HTTPStatusError messages ("... for url '...'" with no "GET"), so the
+# uppercase token only survives in old-format logs; on current logs the verb
+# is evidenced by the traceback call site (``await client.get(...)``), which
+# the alternation below also accepts. The counter is informational — it
+# never affects the verdict.
+_HTTP_VERB_RE = re.compile(r"\bGET\b|\bclient\.get\b")
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +208,7 @@ def _extract_http_status_codes(obj: dict[str, Any]) -> list[int]:
 
 
 def _get_verb_seen(obj: dict[str, Any]) -> bool:
-    """True if the HTTP verb GET appears in any forensic surface."""
+    """True if HTTP verb evidence (``GET`` or the ``client.get`` call site) appears."""
     surfaces = [str(obj.get("message", "")), str(obj.get("stack_trace", ""))]
     et = obj.get("exception_tree")
     if isinstance(et, dict):
@@ -210,6 +234,11 @@ def validate_entry(obj: dict[str, Any]) -> tuple[bool, list[str]]:
         if key not in obj:
             errors.append(f"missing required field: {key!r}")
         elif obj[key] in (None, ""):
+            if key == "async_task" and not _TASK_KEY_MUST_BE_NON_EMPTY:
+                # Python 3.11: LogRecord.taskName does not exist yet
+                # (CPython gh-97263), so the formatter legitimately emits
+                # null — tolerated instead of failing every entry (I-18).
+                continue
             errors.append(f"empty required field: {key!r}")
 
     # level domain ---------------------------------------------------------
@@ -396,7 +425,7 @@ def format_report(report: TelemetryReport) -> str:
         for cls, count in sorted(report.exception_classes.items()):
             lines.append(f"    {cls}: {count}")
     else:
-        lines.append("  (ninguna — ver nota sobre app_operator.py abajo)")
+        lines.append("  (ninguna — una corrida caos debería emitirlas en las entradas ERROR del except*)")
     lines.append(f"  Entradas con stack_trace:    {report.stack_trace_present}")
     lines.append("")
 
@@ -409,7 +438,7 @@ def format_report(report: TelemetryReport) -> str:
             lines.append(f"  HTTP {code}: {report.http_status_codes[code]} aparición(es) verificada(s)")
     else:
         lines.append("  (no se detectaron códigos de estado HTTP)")
-    lines.append(f"  Verbo GET detectado en {report.get_verb_seen} entrada(s)")
+    lines.append(f"  Verbo GET detectado en {report.get_verb_seen} entrada(s) (contador informativo)")
     lines.append("")
 
     # Metadata integrity ---------------------------------------------------
@@ -417,7 +446,8 @@ def format_report(report: TelemetryReport) -> str:
     lines.append("  Integridad de metadatos")
     lines.append("-" * 72)
     lines.append(f"  Campos requeridos: {', '.join(REQUIRED_FIELDS)}")
-    lines.append(f"  Entradas con 'asctime' (campo extra de la consola): {report.asctime_present}")
+    lines.append(f"  Entradas con 'asctime' (legado pre-PR #5 — el formateador actual ya no lo emite): "
+                 f"{report.asctime_present}")
     if report.providers_seen:
         lines.append(f"  Proveedores vistos: "
                      + ", ".join(f"{p}×{n}" for p, n in sorted(report.providers_seen.items())))
@@ -466,6 +496,10 @@ def format_report(report: TelemetryReport) -> str:
 # ---------------------------------------------------------------------------
 # Bundled self-test (validates the documented exception_tree shape)
 # ---------------------------------------------------------------------------
+# Sample cause message and stack_trace follow the CURRENT httpx 0.28 output
+# format (issue I-20): status-error messages no longer end with the verb, so
+# the GET evidence now lives in the traceback's call-site frame
+# (``await client.get(...)``) — mirroring what real logs carry.
 _SELF_TEST_SAMPLE = (
     '{"timestamp": "2026-08-25T22:49:05Z", "level": "ERROR", "logger": "triton_monitor", '
     '"message": "Fallo de conexión", "async_task": "Task-Azure", "thread_name": "MainThread", '
@@ -473,9 +507,11 @@ _SELF_TEST_SAMPLE = (
     '"exception_tree": {"class": "NetworkPeeringError", "message": "Fallo de conexión...", '
     '"notes": ["Provider_ID: Azure", "HTTP_Status_Code: 504"], '
     '"cause": {"class": "HTTPStatusError", '
-    '"message": "Server error \'504 Gateway Timeout\' for url \'https://httpbin.org/status/504\' GET", '
+    '"message": "Server error \'504 GATEWAY TIMEOUT\' for url \'https://httpbin.org/status/504\'", '
     '"notes": []}}, '
-    '"stack_trace": "Traceback (most recent call last):\\n  File ..."}'
+    '"stack_trace": "Traceback (most recent call last):\\n'
+    '  File \\"src/triton_telemetry/core.py\\", line 71, in _execute_telemetry_exchange\\n'
+    '    response = await client.get(url, timeout=timeout)"}'
 )
 
 

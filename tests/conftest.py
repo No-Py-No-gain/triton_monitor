@@ -2,7 +2,11 @@
 
 This file is intentionally side-effect free with respect to the ``src/`` tree:
 the chaos suite only ever talks to the CLI through ``subprocess`` so the
-production package is never imported in-process during the tests.
+production package is never imported in-process during the tests. The single
+sanctioned exception is the DNS-collapse test (issue I-11), which prepends
+``src/`` to ``sys.path`` at runtime and imports ``triton_telemetry`` because
+the CLI exposes no URL parameter to inject a nonexistent host — see the
+justification in that test. No ``src/`` file is ever modified.
 """
 from __future__ import annotations
 
@@ -95,5 +99,13 @@ def requires_network():
 
 @pytest.fixture
 def log_file() -> Path:
-    """Path to the active (uncompressed) log file at the project root."""
+    """Path to the active (uncompressed) log file at the project root.
+
+    Issue I-13: this fixture used to have zero consumers. It was kept and
+    consumed (rather than retired) by ``test_chaos_run_logs_exception_tree``,
+    which runs a chaos cycle with ``cwd`` pinned to this path and then
+    verifies the persisted ``exception_tree`` entries with the validator's
+    pure functions — the end-to-end log verification the fixture was
+    originally designed for.
+    """
     return LOG_FILE

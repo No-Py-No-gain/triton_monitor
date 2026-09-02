@@ -1,24 +1,39 @@
 """Sub-punto 1 — Suite de Simulacion de Caos for the Triton Monitor CLI.
 
-Every test exercises the CLI as a black box through ``subprocess``. We never
-import from ``src/`` so the production package is exercised exactly the way a
-real operator invokes it, and other branches remain untouched.
+Almost every test exercises the CLI as a black box through ``subprocess`` so
+the production package runs exactly the way a real operator invokes it. The
+single sanctioned exception is the DNS-collapse test (issue I-11): the CLI
+exposes no URL parameter, so that test imports ``triton_telemetry`` directly
+to point ``scan_all_providers`` at a reserved ``*.invalid`` host — see the
+justification in the test itself. No ``src/`` file is ever modified.
 
 Markers
 -------
-``@pytest.mark.integration`` — needs live network (jsonplaceholder / httpbin).
-``@pytest.mark.unit``        — pure argparse validation, no network required.
+``@pytest.mark.integration`` — exercises the real network stack or the real
+CLI/logging pipeline (jsonplaceholder / httpbin / DNS resolution).
+``@pytest.mark.unit``        — pure validation logic, no network required.
 
-Known issue accounted for
--------------------------
-``asyncio.TaskGroup`` in ``core.py`` is fail-fast: the first provider task to
-raise cancels its siblings, so in chaos mode only ONE ``except*`` block fires
-per run instead of three concurrent ones. The chaos assertions therefore check
-that *at least one* forensic marker appears, not all three. This race is
-tracked for another integrante and is intentionally not fixed here.
+Concurrent incident coverage (post-fix reality)
+-----------------------------------------------
+``asyncio.TaskGroup``'s native fail-fast race (the first provider task to
+raise cancels its siblings, so only one ``except*`` block would fire) is
+SOLVED in ``core.py`` by the ``_run_mission_with_capture`` wrapper
+(``core.py:220-240``): every mission is allowed to finish and its incident
+returns as a sentinel value, so the re-raised ExceptionGroup is complete and
+every ``except*`` block whose class is present fires. A chaos run therefore
+surfaces ALL the concurrent incidents the current triggers produce —
+empirically three: the AWS timeout (ProviderTimeoutError) plus Azure 504 and
+GCP 422 (both NetworkPeeringError since FIX 2, commit 09be0d8). The
+``CORRUPTOS`` marker is deliberately NOT asserted (and asserted absent): FIX
+2 pointed the GCP trigger at ``httpbin.org/status/422`` instead of the
+plantilla's ``/xml`` endpoint, so chaos never produces a
+CorruptedPayloadError until issue I-04 restores that trigger on its owner
+lane.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 import sys
 import tempfile
@@ -26,13 +41,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
+from tests import validate_telemetry
+
 # Forensic markers emitted by the ``except*`` blocks in ``app_operator.py``.
 # ``CONEXION`` carries an accent in the real output ("CONEXIÓN"); we also
 # accept ``ROUTING`` which always co-occurs, so encoding hiccups never flake.
+# ``CORRUPT_MARKER`` is kept only for the divergence guard in test 2: chaos
+# must NOT produce it on this branch (see the note there and issue I-04).
 TIMEOUT_MARKER = "TIMEOUTS"
 CORRUPT_MARKER = "CORRUPTOS"
 CONNECTION_MARKERS = ("CONEXIÓN", "ROUTING")
-ALL_CHAOS_MARKERS = (TIMEOUT_MARKER, CORRUPT_MARKER, *CONNECTION_MARKERS)
 
 VALID_CLUSTER = "cluster-us-east-01"
 CLI_TIMEOUT = 30  # seconds per subprocess
@@ -46,11 +64,12 @@ def test_timeout_chaos_forces_provider_timeout(run_cli, requires_network):
     """Chaos + 0.1s timeout must surface a ProviderTimeoutError.
 
     In chaos mode AWS hits ``httpbin.org/delay/3`` which sleeps 3s; with a
-    0.1s timeout the request times out well before the network round-trip of
-    the other providers, so ProviderTimeoutError wins the TaskGroup race and
-    the ``except* ProviderTimeoutError`` block prints the TIMEOUTS marker.
-    Using ``--chaos`` (rather than a bare 0.1s against jsonplaceholder) keeps
-    the trigger deterministic regardless of how fast the local link is.
+    0.1s timeout the AWS request times out long before the endpoint answers,
+    so the ``except* ProviderTimeoutError`` block prints the TIMEOUTS marker
+    (the sibling missions still complete thanks to the anti-fail-fast
+    wrapper — see the module docstring). Using ``--chaos`` (rather than a
+    bare 0.1s against jsonplaceholder) keeps the trigger deterministic
+    regardless of how fast the local link is.
     """
     result = run_cli("AWS", "Azure", "GCP", "-c", VALID_CLUSTER, "--chaos", "-t", "0.1")
 
@@ -61,23 +80,55 @@ def test_timeout_chaos_forces_provider_timeout(run_cli, requires_network):
 
 
 # ===========================================================================
-# 2. Chaos mode triggers at least one exception group handler
+# 2. Chaos mode surfaces the COMPLETE concurrent incident set
 # ===========================================================================
 @pytest.mark.integration
 def test_chaos_mode_triggers_exceptions(run_cli, requires_network):
-    """``--chaos -t 1.5`` must fire at least one ``except*`` block.
+    """``--chaos -t 1.5`` must surface every concurrent ``except*`` block.
 
-    Azure's ``httpbin.org/status/504`` returns immediately with HTTP 504 and
-    typically wins the TaskGroup race, surfacing the CONEXIÓN/ROUTING marker.
-    Because of the fail-fast race we only assert that *some* forensic marker
-    appears — not all three. Exit code is 0 because ``except*`` contains it.
+    The anti-fail-fast wrapper (``_run_mission_with_capture``) lets all three
+    missions finish, so the ExceptionGroup re-raised to ``asyncio.run`` is
+    complete and both ``except*`` classes present in it fire: the AWS timeout
+    (ProviderTimeoutError -> TIMEOUTS header) and the Azure 504 + GCP 422
+    pair (both NetworkPeeringError since FIX 2 -> the CONEXIÓN/ROUTING header
+    reporting "2 incidentes"). We assert every marker the current triggers
+    actually produce, plus the forensic notes proving BOTH status codes
+    (504 and 422) reached the group — direct evidence for the consigna's
+    "fallos simultáneos agrupados y capturados quirúrgicamente".
+
+    ``CORRUPTOS`` is intentionally asserted ABSENT, not just ignored (issue
+    I-10/I-04 divergence): since FIX 2 the GCP chaos trigger is
+    ``httpbin.org/status/422`` (-> NetworkPeeringError), so chaos cannot
+    produce a CorruptedPayloadError on this branch. If I-04 ever restores
+    the plantilla's ``/xml`` trigger, flip these assertions (CORRUPTOS in,
+    the 422 note out). Exit code is 0 because ``except*`` contains it.
     """
     result = run_cli("AWS", "Azure", "GCP", "-c", VALID_CLUSTER, "--chaos", "-t", "1.5")
 
     assert result.returncode == 0, f"expected exit 0, got {result.returncode}\nstderr:\n{result.stderr}"
     combined = result.stdout + result.stderr
-    assert any(marker in combined for marker in ALL_CHAOS_MARKERS), (
-        f"expected at least one of {ALL_CHAOS_MARKERS} in output\nstdout:\n{result.stdout}"
+
+    # Timeout incident: AWS /delay/3 cannot answer within 1.5s.
+    assert TIMEOUT_MARKER in combined, (
+        f"expected '{TIMEOUT_MARKER}' in output\nstdout:\n{result.stdout}"
+    )
+    # Transport/status incidents: Azure 504 + GCP 422 grouped in one header.
+    assert any(marker in combined for marker in CONNECTION_MARKERS), (
+        f"expected one of {CONNECTION_MARKERS} in output\nstdout:\n{result.stdout}"
+    )
+    # Forensic notes: BOTH status-code incidents reached the group.
+    assert "HTTP_Status_Code: 504" in combined, (
+        "expected the Azure 504 forensic note in output\nstdout:\n" + result.stdout
+    )
+    assert "HTTP_Status_Code: 422" in combined, (
+        "expected the GCP 422 forensic note in output\nstdout:\n" + result.stdout
+    )
+    # Divergence guard (I-04): no /xml trigger on this branch, so a chaos
+    # run must NOT report corrupted payloads.
+    assert CORRUPT_MARKER not in combined, (
+        f"chaos produced '{CORRUPT_MARKER}' — did I-04 restore the /xml "
+        f"trigger? Then update these assertions (422 note out, CORRUPTOS in)."
+        f"\nstdout:\n{result.stdout}"
     )
 
 
@@ -218,3 +269,166 @@ def test_concurrent_massive_cli_invocations(cli_path, requires_network):
     assert not bad, f"unexpected exit codes (crashes): {bad}"
 
     assert 0 in codes, "expected at least one successful (exit 0) invocation in the batch"
+
+
+# ===========================================================================
+# 9. DNS/URL collapse: nonexistent host -> NetworkPeeringError (I-11)
+# ===========================================================================
+@pytest.mark.integration
+def test_dns_collapse_maps_to_network_peering_error(cli_path, monkeypatch):
+    """A base URL on a reserved ``*.invalid`` host must collapse into
+    ``NetworkPeeringError`` via ``httpx.RequestError`` (consigna 2.2.6.1:
+    "modificando la base URL a hosts inexistentes para gatillar
+    NetworkPeeringError"; issue I-11, option i).
+
+    This is the ONE test that imports ``triton_telemetry`` instead of driving
+    the CLI as a subprocess: the CLI exposes no URL parameter, so a black-box
+    run cannot inject a nonexistent host, and the env-var override variant
+    (option ii) would touch ``core.py`` — another lane. Importing the package
+    without modifying it is the sanctioned compromise. ``.invalid`` is
+    reserved by RFC 6761 and never resolves, so the DNS attempt fails both
+    online (NXDOMAIN) and offline; the test needs the resolution to FAIL,
+    which is why it does not use the ``requires_network`` probe. Marked
+    integration because it still exercises the real resolver/socket stack.
+    """
+    monkeypatch.syspath_prepend(str(cli_path.parent))  # <repo>/src on sys.path
+    from triton_telemetry import core
+    import httpx
+
+    # Point every nominal mission at a host that cannot exist. The missions
+    # read this registry at call time, so the runtime patch takes effect
+    # without touching any src/ file.
+    monkeypatch.setattr(
+        core,
+        "PROVIDER_ENDPOINTS",
+        {p: f"https://triton-dns-collapse.invalid/posts/{i}"
+         for i, p in enumerate(("AWS", "Azure", "GCP"), start=1)},
+    )
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        asyncio.run(core.scan_all_providers(["AWS", "Azure", "GCP"], 5.0))
+
+    group = excinfo.value
+    assert len(group.exceptions) == 3, (
+        "expected all three concurrent DNS incidents grouped, got "
+        f"{[type(e).__name__ for e in group.exceptions]}"
+    )
+    for exc in group.exceptions:
+        assert isinstance(exc, core.NetworkPeeringError), (
+            f"expected NetworkPeeringError, got {type(exc).__name__}"
+        )
+        # The exact path under test (H2): the native transport error (DNS /
+        # connect failure) must be the recorded cause of the semantic error.
+        assert isinstance(exc.__cause__, httpx.RequestError), (
+            f"expected an httpx.RequestError cause, got {type(exc.__cause__).__name__}"
+        )
+        notes = getattr(exc, "__notes__", [])
+        assert any("Native_Error_Type:" in note for note in notes), (
+            f"expected a 'Native_Error_Type' forensic note, got {notes}"
+        )
+
+
+# ===========================================================================
+# 10. Chaos run persists the exception tree to the JSON log (I-13)
+# ===========================================================================
+@pytest.mark.integration
+def test_chaos_run_logs_exception_tree(run_cli, log_file):
+    """A chaos run must persist ``exception_tree`` entries in the JSON log.
+
+    This test consumes the ``log_file`` fixture (issue I-13: it previously
+    had zero consumers — consuming it was preferred over retiring it because
+    it delivers the end-to-end evidence the fixture was designed for:
+    ``exc_info=exc`` passed by ``app_operator.py`` survives
+    ``PreservingQueueHandler`` and lands in the JSON as a recursive
+    ``exception_tree``). The CLI runs with ``cwd=log_file.parent`` so the
+    per-process log lands exactly on the fixture path regardless of where
+    pytest was invoked from. ``requires_network`` is deliberately NOT used:
+    the assertions hold whether the providers answer or not (unreachable
+    providers surface as NetworkPeeringError trees — the DNS-collapse case).
+    Validation reuses the pure functions of ``tests/validate_telemetry.py``
+    instead of re-implementing the checks.
+    """
+    result = run_cli(
+        "AWS", "Azure", "GCP", "-c", VALID_CLUSTER, "--chaos", "-t", "1.5",
+        cwd=log_file.parent,
+    )
+
+    assert result.returncode == 0, f"expected exit 0, got {result.returncode}\nstderr:\n{result.stderr}"
+    assert log_file.is_file(), f"expected the CLI to write {log_file}"
+
+    entries: list[dict] = []
+    for line in log_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # stale/historical line, not this run's concern
+
+    error_entries = [e for e in entries if e.get("level") == "ERROR"]
+    assert error_entries, "chaos run must log ERROR entries"
+
+    tree_entries = [e for e in error_entries if isinstance(e.get("exception_tree"), dict)]
+    assert tree_entries, (
+        "expected ERROR entries carrying exception_tree "
+        "(exc_info must survive the logging queue)"
+    )
+    for entry in tree_entries:
+        valid, errors = validate_telemetry.validate_entry(entry)
+        assert valid, f"validator rejected a logged exception entry: {errors}"
+        # exception_tree entries can only exist post-PR #5 (the queue now
+        # preserves exc_info), and post-PR #5 never emits asctime — so a
+        # leak here would be a genuine regression (issue I-12).
+        assert "asctime" not in entry, "asctime leaked into an exception entry"
+
+    classes = {e["exception_tree"].get("class") for e in tree_entries}
+    assert classes & {"ProviderTimeoutError", "NetworkPeeringError"}, (
+        f"expected chaos-triggered exception classes in the tree, got {classes}"
+    )
+
+
+# ===========================================================================
+# 11. Validator tolerates a null task key below Python 3.12 (I-18, unit)
+# ===========================================================================
+@pytest.mark.unit
+def test_validator_tolerates_null_task_key_below_python_312(monkeypatch):
+    """``LogRecord.taskName`` exists only from Python 3.12 (CPython gh-97263),
+    so on 3.11 — the documented minimum — the formatter emits
+    ``task_name``/``async_task`` as null. The validator must tolerate the
+    EMPTY task key there instead of failing every entry (issue I-18, option
+    a). The 3.11 behavior is simulated by forcing the validator's version
+    flag off; the suite itself runs on 3.14, where the non-empty requirement
+    stays active and is asserted first. Absence of the key is never
+    tolerated on any interpreter.
+    """
+    entry = {key: "placeholder" for key in validate_telemetry.REQUIRED_FIELDS}
+    entry.update(
+        {
+            "timestamp": "2026-09-01T00:00:00Z",
+            "level": "ERROR",
+            "logger": "triton_monitor",
+            "message": "Fallo de conexión",
+            "thread_name": "MainThread",
+            "filename": "core.py",
+            "line": 81,
+            "async_task": None,  # what Python 3.11 emits (no taskName attr)
+        }
+    )
+
+    # On >= 3.12 (this suite's interpreter) the empty task key is a violation.
+    valid, errors = validate_telemetry.validate_entry(entry)
+    if sys.version_info >= (3, 12):
+        assert not valid
+        assert "empty required field: 'async_task'" in errors
+
+    # Simulated Python 3.11: the null task key is tolerated.
+    monkeypatch.setattr(validate_telemetry, "_TASK_KEY_MUST_BE_NON_EMPTY", False)
+    valid, errors = validate_telemetry.validate_entry(entry)
+    assert valid, f"entry with null async_task must be valid on 3.11: {errors}"
+
+    # A MISSING task key is still a violation on every interpreter.
+    del entry["async_task"]
+    valid, errors = validate_telemetry.validate_entry(entry)
+    assert not valid
+    assert "missing required field: 'async_task'" in errors
