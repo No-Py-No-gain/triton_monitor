@@ -31,8 +31,8 @@ flowchart TD
         T3 --> EX
         EX --> CL
         EX -->|"httpx.TimeoutException"| E1["ProviderTimeoutError"]
-        EX -->|"httpx.HTTPStatusError · httpx.RequestError"| E2["NetworkPeeringError"]
-        EX -->|"JSONDecodeError · JSON no-objeto"| E3["CorruptedPayloadError"]
+        EX -->|"httpx.RequestError (DNS/ruteo/conexión)"| E2["NetworkPeeringError"]
+        EX -->|"httpx.HTTPStatusError · JSONDecodeError · JSON no-objeto"| E3["CorruptedPayloadError"]
     end
 
     EG["ExceptionGroup con TODOS los incidentes<br/>(raise ... from + add_note)"]
@@ -104,7 +104,7 @@ python3 src/app_operator.py <proveedores> -c <cluster-id> [opciones]
 | `proveedores` (posicional) | Sí | Uno o más proveedores a monitorear, restringidos por `choices` de dominio: `AWS`, `Azure`, `GCP`. |
 | `-c`, `--cluster-id` | Sí | Identificador del clúster. `parse_cluster_id()` valida por expresión regular el patrón `cluster-<region>-<NN>` (ej.: `cluster-us-east-01`). |
 | `-t`, `--timeout` | No | Tiempo límite por petición HTTP, en segundos. Flotante estricto en `[0.1, 5.0]`; por defecto `2.5`. |
-| `--chaos` | No | Inyecta fallos reales de red vía httpbin (timeout de 3 s, HTTP 504 y HTTP 422). |
+| `--chaos` | No | Inyecta fallos reales vía httpbin: timeout de 3 s (AWS), HTTP 504 (Azure) y payload XML corrupto (GCP, `/xml`). |
 | `-m`, `--mode` | No | Modo operativo: `nominal` (defecto), `debug` o `emergency`. |
 | `--verbose` \| `--quiet` | No | Grupo mutuamente excluyente: salida detallada en consola (incluye DEBUG) o salida mínima (solo WARNING y superior). |
 
@@ -132,13 +132,13 @@ La aplicación **no inicia consultas de red**: `argparse` atrapa la `ArgumentTyp
 python3 src/app_operator.py AWS Azure GCP -c cluster-us-west-02 -t 1.5 --chaos
 ```
 
-Se gatillan **fallos reales y simultáneos** contra httpbin: AWS consulta `/delay/3` con un límite de `1.5 s` y colapsa por timeout (`ProviderTimeoutError`), Azure recibe un **HTTP 504** y GCP un **HTTP 422** — ambos mapeados a `NetworkPeeringError` con el `HTTP_Status_Code` en las notas forenses. El `TaskGroup` completa todas las tareas, el `ExceptionGroup` llega con el inventario completo de incidentes y los bloques `except*` lo capturan de forma quirúrgica, imprimiendo las notas forenses en consola y persistiendo el volcado estructurado en `triton_services.log`. El proceso **finaliza con código `0`**, sin cierre abrupto.
+Se gatillan **fallos reales y simultáneos** contra httpbin: AWS consulta `/delay/3` con un límite de `1.5 s` y colapsa por timeout (`ProviderTimeoutError`), Azure recibe un **HTTP 504** y GCP consulta `/xml`, que responde **HTTP 200 con un cuerpo XML** cuyo parseo JSON falla. Los dos últimos incidentes se mapean a `CorruptedPayloadError` — la consigna asigna esa excepción tanto a payloads corruptos como a estatus HTTP fallidos (§2.2.1) y prescribe explícitamente `raise CorruptedPayloadError(...) from error_nativo` para `httpx.HTTPStatusError` (§2.2.2) — con `HTTP_Status_Code` o `Provider_ID`/`Endpoint`/`Content-Type` en las notas forenses. El `TaskGroup` completa todas las tareas, el `ExceptionGroup` llega con el inventario completo de incidentes y los bloques `except*` lo capturan de forma quirúrgica: la consola muestra la cabecera de TIMEOUTS (1 incidente) y la de payloads corruptos / estatus fallidos (2 incidentes) con sus notas FORENSE — sin tracebacks crudos, que el formateador de consola reemplaza por una línea de omisión — mientras el árbol forense completo (`exception_tree` + `stack_trace`) persiste como JSON en `triton_services.log`. El proceso **finaliza con código `0`**, sin cierre abrupto.
 
-> `CorruptedPayloadError` se reserva para respuestas corruptas o fuera de contrato (payload no-JSON, o JSON válido que no es un objeto): es el camino que ejercita `_execute_telemetry_exchange()` ante datos inválidos.
+> `CorruptedPayloadError` cubre respuestas corruptas, no serializables, fuera de contrato (JSON válido que no es un objeto) y estatus HTTP fallidos (4xx/5xx), según el texto de rol §2.2.1 de la consigna. `NetworkPeeringError` queda exclusivamente para fallos de DNS, ruteo o resolución de hosts — el camino `httpx.RequestError`, ejercitado por la suite de caos con hosts `*.invalid` (test 9) y por cualquier corrida sin conectividad.
 
 ### Salida estructurada (log JSON)
 
-Cada corrida escribe `triton_services.log` en el directorio de trabajo desde donde se invocó la CLI. Cada línea es un objeto JSON con `timestamp` ISO 8601 UTC, `level`, `logger`, `message`, `task_name` (nombre de la tarea `asyncio`, ej.: `TritonTask-Azure`), `thread_name`, `filename` y `line`, además de cualquier metadato inyectado vía `extra=` (por ejemplo `provider` y `status_code` en las telemetrías nominales). El formateador `AsyncJSONFormatter` serializa de forma recursiva el árbol de excepciones —clase, mensaje, notas dinámicas de `add_note()`, causas encadenadas con `raise ... from` y `ExceptionGroup` anidados— cuando el registro porta información de excepción. Al alcanzar los 2 MB el archivo rota: se conservan hasta 3 históricos comprimidos como `triton_services.log.N.gz` mediante los callbacks de gzip.
+Cada corrida escribe `triton_services.log` en el directorio de trabajo desde donde se invocó la CLI. Cada línea es un objeto JSON con `timestamp` ISO 8601 UTC, `level`, `logger`, `message`, `task_name` (nombre de la tarea `asyncio`, ej.: `TritonTask-Azure`), `thread_name`, `filename` y `line`, además de cualquier metadato inyectado vía `extra=` (por ejemplo `provider` y `status_code` en las telemetrías nominales). El formateador `AsyncJSONFormatter` serializa de forma recursiva el árbol de excepciones —clase, mensaje, notas dinámicas de `add_note()`, causas encadenadas con `raise ... from` y `ExceptionGroup` anidados— cuando el registro porta información de excepción. En consola, en cambio, el formateador `ConsoleFormatter` omite los tracebacks crudos y los reemplaza por una única línea informativa (`[traceback omitido en consola — árbol forense completo en triton_services.log]`): la salida del operador queda legible y el árbol forense completo vive solo en el log JSON. Al alcanzar los 2 MB el archivo rota: se conservan hasta 3 históricos comprimidos como `triton_services.log.N.gz` mediante los callbacks de gzip.
 
 ## Estructura del proyecto
 
@@ -154,10 +154,9 @@ triton_monitor/
 │   └── app_operator.py         # Punto de entrada CLI: argparse, captura quirúrgica except* y liberación de recursos en finally (PEP 765)
 ├── tests/
 │   ├── conftest.py             # Fixtures: invocación de la CLI por subprocess, sondeo de red y marcadores unit/integration
-│   ├── test_chaos_suite.py     # Suite de caos black-box: 8 tests (3 unit sin red + 5 integration con red)
+│   ├── test_chaos_suite.py     # Suite de caos black-box: 11 tests (4 unit sin red + 7 integration con red)
 │   └── validate_telemetry.py   # Validador forense del log JSON y de la integridad gzip (incluye --self-test)
-├── requirements.txt            # Dependencias: httpx (runtime) + pytest / pytest-asyncio (testing)
-├── CHANGELOG.md                # Registro técnico de cambios del proyecto
+ ├── requirements.txt            # Dependencias: httpx (runtime) + pytest / pytest-asyncio (testing)
 └── README.md                   # Este documento
 ```
 
@@ -165,8 +164,8 @@ En tiempo de ejecución se generan localmente `triton_services.log` (y sus hist�
 
 ## Decisiones de diseño destacadas
 
-1. **Wrapper anti-fail-fast en el `TaskGroup`** — `_run_mission_with_capture()` atrapa el `TritonError` de cada misión y lo devuelve como valor; cuando **todas** las tareas terminan, `scan_all_providers()` re-eleva un `ExceptionGroup` con el inventario completo de incidentes. La semántica nativa del `TaskGroup` cancela las tareas hermanas al primer fallo; un monitor de telemetría debe reportar el panorama completo de los tres proveedores en cada ciclo. En el escenario C se reportan los tres incidentes simultáneos (1 timeout + 2 estatus HTTP).
-2. **Mapeo semántico con encadenamiento explícito** — todo error nativo de `httpx` se traduce a una excepción de dominio con `raise ... from native_error` (el traceback de la causa raíz queda intacto) y contexto forense dinámico vía `add_note()`. Los estatus HTTP de fallo (504/422) se mapean a `NetworkPeeringError` —son un problema de red/servidor— y `CorruptedPayloadError` queda reservado para payloads corruptos o fuera de contrato: dos causas distintas no comparten excepción.
+1. **Wrapper anti-fail-fast en el `TaskGroup`** — `_run_mission_with_capture()` atrapa el `TritonError` de cada misión y lo devuelve como valor; cuando **todas** las tareas terminan, `scan_all_providers()` re-eleva un `ExceptionGroup` con el inventario completo de incidentes. La semántica nativa del `TaskGroup` cancela las tareas hermanas al primer fallo; un monitor de telemetría debe reportar el panorama completo de los tres proveedores en cada ciclo. En el escenario C se reportan los tres incidentes simultáneos (1 timeout + 1 estatus HTTP fallido + 1 payload corrupto).
+2. **Mapeo semántico con encadenamiento explícito** — todo error nativo de `httpx` se traduce a una excepción de dominio con `raise ... from native_error` (el traceback de la causa raíz queda intacto) y contexto forense dinámico vía `add_note()`. Los estatus HTTP fallidos (504, 422) y los payloads corruptos o fuera de contrato se mapean a `CorruptedPayloadError` —criterio de los textos de rol de la consigna: §2.2.1 la define para «respuestas corruptas o estatus fallidos HTTP» y §2.2.2 prescribe `raise CorruptedPayloadError(...) from error_nativo` ante `httpx.HTTPStatusError`—. `NetworkPeeringError` queda exclusivamente para fallos de DNS, ruteo o denegación de conexión (el camino `httpx.RequestError`, cubierto por la suite de caos con hosts inexistentes y por corridas sin conectividad).
 3. **Emisión de logs no bloqueante** — el bucle de eventos nunca escribe en disco: el logger solo entrega el `LogRecord` al `QueueHandler`, que lo encola en memoria (`queue.Queue`); el hilo secundario del `QueueListener` consume la cola y ejecuta los handlers físicos (consola y archivo). Toda escritura física queda canalizada por la cola sincronizada, como exige el hard gate de la consigna.
 4. **Compresión gzip atómica en la rotación** — `gzip_rotator()` comprime el histórico hacia un archivo temporal en el mismo directorio y lo instala con `os.replace()` (reemplazo atómico dentro del mismo sistema de archivos); el archivo plano original se elimina solo después de confirmar que la compresión terminó correctamente. El límite es de 2 MB por archivo con 3 históricos, para acotar el uso de disco.
 
@@ -188,7 +187,4 @@ python tests/validate_telemetry.py [directorio-de-logs]
 
 La suite es **black-box**: invoca la CLI por `subprocess` sin importar `src/`, del mismo modo que la operaría un usuario real. Los 5 tests marcados `integration` requieren salida a internet hacia `jsonplaceholder.typicode.com` y `httpbin.org`; sin conectividad se omiten automáticamente (la fixture `requires_network` sondea los hosts antes de fallar). El validador forense certifica los campos requeridos de cada entrada JSON, el dominio de niveles, los códigos de estado HTTP detectados y la integridad de la descompresión gzip de los históricos; sale con código `0` cuando no hay violaciones.
 
-## Historial de cambios
-
-El registro técnico de cambios del proyecto (formato Keep a Changelog) está en [CHANGELOG.md](CHANGELOG.md).
 
