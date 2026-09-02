@@ -40,7 +40,8 @@ PROVIDER_ENDPOINTS = {
 # ---------------------------------------------------------------------------
 TIMEOUT_TRIGGER_URL = "https://httpbin.org/delay/3"             # Retardo controlado real de 3 segundos
 GATEWAY_TIMEOUT_TRIGGER_URL = "https://httpbin.org/status/504"  # Estatus HTTP 504 (Gateway Timeout)
-UNPROCESSABLE_TRIGGER_URL = "https://httpbin.org/status/422"    # Estatus HTTP 422 (Unprocessable Entity)
+CORRUPTED_TRIGGER_URL = "https://httpbin.org/xml"               # HTTP 200 + cuerpo XML → el parseo JSON falla →
+                                                                 # CorruptedPayloadError (Escenario C de la consigna)
 
 # Contexto forense estandarizado para auditoría (visible vía __notes__)
 TIMEOUT_FORENSIC_NOTE = "Timeout superado en el nodo de telemetría de respaldo"
@@ -92,12 +93,13 @@ async def _execute_telemetry_exchange(
         raise semantic_error from native_error
 
     except httpx.HTTPStatusError as native_error:
-        # FIX 2: un 504/422 es un problema de RED/SERVIDOR, no de payload
-        # corrupto — antes esto mapeaba (mal) a CorruptedPayloadError y
-        # mezclaba dos causas distintas bajo la misma excepción semántica.
-        # Ahora coincide con el criterio usado en el resto del proyecto:
-        # fallas de transporte/estatus HTTP -> NetworkPeeringError.
-        semantic_error = NetworkPeeringError(
+        # Criterio de los textos de rol de la consigna (§2.2.1/§2.2.2): los
+        # estatus HTTP fallidos (4xx/5xx) son "respuestas corruptas o estatus
+        # fallidos HTTP" y se traducen a CorruptedPayloadError, exactamente
+        # como prescribe Integrante 2: "raise CorruptedPayloadError(...)
+        # from error_nativo". NetworkPeeringError queda exclusivamente para
+        # fallos de DNS/ruteo/resolución de hosts (httpx.RequestError, abajo).
+        semantic_error = CorruptedPayloadError(
             f"El proveedor {provider} respondió con un error HTTP: "
             f"{native_error.response.status_code}."
         )
@@ -110,9 +112,19 @@ async def _execute_telemetry_exchange(
         # JSONDecodeError hereda de ValueError, por eso alcanza con capturar
         # ambos en un solo except: cubre "no vino JSON" y "vino JSON mal
         # formado" con el mismo tratamiento.
-        raise CorruptedPayloadError(
+        semantic_error = CorruptedPayloadError(
             f"El proveedor {provider} devolvió un payload no serializable o con errores de paridad."
-        ) from native_error
+        )
+        # `response` está garantizado en scope en este except: solo puede
+        # dispararse desde response.json(), o sea DESPUÉS de que el GET y
+        # raise_for_status() completaron (caso real del Escenario C: GCP
+        # devuelve XML con HTTP 200 y el parseo JSON explota acá). Sin estas
+        # notas el incidente llegaría a consola sin salida FORENSE.
+        semantic_error.add_note(
+            f"Provider_ID: {provider} | Endpoint: {url} | "
+            f"Content-Type: {response.headers.get('content-type', 'desconocido')}"
+        )
+        raise semantic_error from native_error
 
     except httpx.RequestError as native_error:
         # Cubre fallas de transporte antes de siquiera recibir una respuesta:
@@ -126,9 +138,14 @@ async def _execute_telemetry_exchange(
     if not isinstance(payload, dict):
         # JSON válido no implica estructura válida: por ejemplo [1, 2, 3]
         # parsea bien pero no tiene .get(), y rompería la línea de abajo.
-        raise CorruptedPayloadError(
+        contract_error = CorruptedPayloadError(
             f"El proveedor {provider} devolvió un JSON válido pero fuera del contrato (tipo: {type(payload).__name__})."
         )
+        contract_error.add_note(
+            f"Provider_ID: {provider} | Contrato: objeto JSON esperado, "
+            f"recibido {type(payload).__name__} | Endpoint: {url}"
+        )
+        raise contract_error
 
     logger.info(
         f"Telemetría recibida exitosamente de {provider}.",
@@ -174,14 +191,19 @@ async def trigger_timeout_scenario(client: httpx.AsyncClient, timeout: float) ->
 
 async def trigger_gateway_timeout_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
     """Gatillo de estatus erróneo 504: response.raise_for_status() eleva el
-    httpx.HTTPStatusError nativo, re-lanzado como NetworkPeeringError encadenado."""
+    httpx.HTTPStatusError nativo, re-lanzado como CorruptedPayloadError encadenado
+    con su HTTP_Status_Code en las notas forenses (estatus HTTP fallido, según
+    el texto de roles §2.2.1/§2.2.2 de la consigna)."""
     return await _execute_telemetry_exchange(client, "Azure", GATEWAY_TIMEOUT_TRIGGER_URL, timeout)
 
 
-async def trigger_unprocessable_entity_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
-    """Gatillo de estatus erróneo 422: valida la misma cadena de resiliencia ante
-    Unprocessable Entity manteniendo íntegro el traceback de la causa raíz."""
-    return await _execute_telemetry_exchange(client, "GCP", UNPROCESSABLE_TRIGGER_URL, timeout)
+async def trigger_corrupted_payload_scenario(client: httpx.AsyncClient, timeout: float) -> Dict[str, Any]:
+    """Gatillo de payload corrupto: /xml responde HTTP 200 con un cuerpo XML, de
+    modo que response.json() dispara un json.JSONDecodeError genuino, capturado y
+    re-lanzado encadenado como CorruptedPayloadError con notas forenses de
+    Provider_ID/Endpoint/Content-Type (Escenario C de la consigna: GCP falla por
+    formato de payload corrupto al devolver XML)."""
+    return await _execute_telemetry_exchange(client, "GCP", CORRUPTED_TRIGGER_URL, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +227,7 @@ NOMINAL_MISSIONS: Dict[str, TelemetryMission] = {
 CHAOS_MISSIONS: Dict[str, TelemetryMission] = {
     "AWS": trigger_timeout_scenario,
     "Azure": trigger_gateway_timeout_scenario,
-    "GCP": trigger_unprocessable_entity_scenario,
+    "GCP": trigger_corrupted_payload_scenario,
 }
 
 

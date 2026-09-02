@@ -8,7 +8,7 @@ Usage::
 
     python3 tests/validate_telemetry.py                 # default: project root
     python3 tests/validate_telemetry.py /path/to/logs   # explicit log dir
-    python3 tests/validate_telemetry.py --self-test     # bundled sample check
+    python3 tests/validate_telemetry.py --self-test     # bundled samples check
 
 The module is importable: ``build_report`` and ``validate_entry`` are pure
 functions usable from other tooling.
@@ -496,34 +496,126 @@ def format_report(report: TelemetryReport) -> str:
 # ---------------------------------------------------------------------------
 # Bundled self-test (validates the documented exception_tree shape)
 # ---------------------------------------------------------------------------
-# Sample cause message and stack_trace follow the CURRENT httpx 0.28 output
-# format (issue I-20): status-error messages no longer end with the verb, so
-# the GET evidence now lives in the traceback's call-site frame
-# (``await client.get(...)``) — mirroring what real logs carry.
-_SELF_TEST_SAMPLE = (
+# Las causas y stack_traces sintéticos siguen el formato ACTUAL de httpx 0.28
+# (issue I-20): los mensajes de estatus ya no terminan con el verbo, así que
+# la evidencia del GET vive en el frame del call-site del traceback
+# (``await client.get(...)``) — igual que en los logs reales. Las tres
+# entradas cubren las clases semánticas completas del dominio:
+#
+# * Azure 504 (estatus HTTP fallido) y GCP /xml (payload corrupto) mapean a
+#   CorruptedPayloadError según §2.2.2 de la consigna: los estatus fallidos
+#   son "respuestas corruptas o estatus fallidos HTTP" y el rol prescribe
+#   ``raise CorruptedPayloadError(...) from error_nativo`` para
+#   ``httpx.HTTPStatusError``.
+# * NetworkPeeringError NO fue eliminada: sigue siendo la clase de
+#   DNS/ruteo/transporte según §2.2.1 y §2.2.5c ("fallos catastróficos de
+#   DNS"); la muestra AWS la ejercita con causa nativa httpx.ConnectError —
+#   lo mismo que produce la suite de caos DNS (test 9) contra hosts
+#   ``*.invalid`` y las corridas offline.
+#
+# El validador en sí (``validate_entry``) es puramente estructural y nunca
+# hardcodea clases de excepción: las muestras demuestran explícitamente las
+# tres clases que el pipeline emite.
+_SELF_TEST_SAMPLES = (
+    # 1) Estatus HTTP fallido (Azure 504): mapea a CorruptedPayloadError
+    #    según §2.2.2 ("raise CorruptedPayloadError(...) from error_nativo").
     '{"timestamp": "2026-08-25T22:49:05Z", "level": "ERROR", "logger": "triton_monitor", '
-    '"message": "Fallo de conexión", "async_task": "Task-Azure", "thread_name": "MainThread", '
+    '"message": "Fallo: El proveedor Azure respondió con un error HTTP: 504.", '
+    '"async_task": "TritonTask-Azure", "thread_name": "MainThread", '
     '"filename": "core.py", "line": 81, "provider": "Azure", '
-    '"exception_tree": {"class": "NetworkPeeringError", "message": "Fallo de conexión...", '
+    '"exception_tree": {"class": "CorruptedPayloadError", '
+    '"message": "El proveedor Azure respondió con un error HTTP: 504.", '
     '"notes": ["Provider_ID: Azure", "HTTP_Status_Code: 504"], '
     '"cause": {"class": "HTTPStatusError", '
     '"message": "Server error \'504 GATEWAY TIMEOUT\' for url \'https://httpbin.org/status/504\'", '
     '"notes": []}}, '
     '"stack_trace": "Traceback (most recent call last):\\n'
-    '  File \\"src/triton_telemetry/core.py\\", line 71, in _execute_telemetry_exchange\\n'
-    '    response = await client.get(url, timeout=timeout)"}'
+    '  File \\"src/triton_telemetry/core.py\\", line 72, in _execute_telemetry_exchange\\n'
+    '    response = await client.get(url, timeout=timeout)"}',
+    # 2) Payload corrupto (GCP /xml): HTTP 200 + cuerpo XML → JSONDecodeError,
+    #    también CorruptedPayloadError (§2.2.2), con notas de contexto de
+    #    Endpoint/Content-Type (Escenario C de la consigna).
+    '{"timestamp": "2026-08-25T22:49:06Z", "level": "ERROR", "logger": "triton_monitor", '
+    '"message": "Fallo: El proveedor GCP devolvió un payload no serializable o con errores de paridad.", '
+    '"async_task": "TritonTask-GCP", "thread_name": "MainThread", '
+    '"filename": "core.py", "line": 78, "provider": "GCP", '
+    '"exception_tree": {"class": "CorruptedPayloadError", '
+    '"message": "El proveedor GCP devolvió un payload no serializable o con errores de paridad.", '
+    '"notes": ["Provider_ID: GCP | Endpoint: https://httpbin.org/xml | Content-Type: application/xml"], '
+    '"cause": {"class": "JSONDecodeError", '
+    '"message": "Expecting value: line 1 column 1 (char 0)", '
+    '"notes": []}}, '
+    '"stack_trace": "Traceback (most recent call last):\\n'
+    '  File \\"src/triton_telemetry/core.py\\", line 78, in _execute_telemetry_exchange\\n'
+    '    payload = response.json()"}',
+    # 3) Fallo físico de transporte/DNS (AWS): NetworkPeeringError según
+    #    §2.2.1/§2.2.5c ("fallos catastróficos de DNS"), causa nativa
+    #    httpx.ConnectError — lo que produce la suite DNS (test 9) contra
+    #    hosts *.invalid y las corridas offline.
+    '{"timestamp": "2026-08-25T22:49:07Z", "level": "ERROR", "logger": "triton_monitor", '
+    '"message": "Fallo: Fallo físico de transporte o ruteo al intentar alcanzar AWS.", '
+    '"async_task": "TritonTask-AWS", "thread_name": "MainThread", '
+    '"filename": "core.py", "line": 72, "provider": "AWS", '
+    '"exception_tree": {"class": "NetworkPeeringError", '
+    '"message": "Fallo físico de transporte o ruteo al intentar alcanzar AWS.", '
+    '"notes": ["Provider_ID: AWS | Native_Error_Type: ConnectError"], '
+    '"cause": {"class": "ConnectError", '
+    '"message": "[Errno -2] Name or service not known", '
+    '"notes": []}}, '
+    '"stack_trace": "Traceback (most recent call last):\\n'
+    '  File \\"src/triton_telemetry/core.py\\", line 72, in _execute_telemetry_exchange\\n'
+    '    response = await client.get(url, timeout=timeout)"}',
 )
 
 
 def _self_test() -> int:
-    """Validate a synthetic entry that exercises the full exception_tree path."""
-    obj = json.loads(_SELF_TEST_SAMPLE)
-    valid, errors = validate_entry(obj)
-    codes = _extract_http_status_codes(obj)
-    print("Self-test sample:")
-    print(f"  valid={valid} errors={errors}")
-    print(f"  http_status_codes={codes} get_verb_seen={_get_verb_seen(obj)}")
-    ok = valid and 504 in codes and _get_verb_seen(obj)
+    """Valida las tres entradas sintéticas de las clases semánticas del dominio.
+
+    Cada entrada ejercita el camino completo de ``exception_tree`` (clase,
+    mensaje, notas y causa encadenada) más los contadores forenses HTTP. El
+    verbo GET se verifica solo en la muestra de estatus: la evidencia vive en
+    el frame del call-site del traceback (issue I-20).
+    """
+    # (clase esperada del árbol, clase esperada de la causa, código HTTP
+    #  esperado o None).
+    expectations = (
+        ("CorruptedPayloadError", "HTTPStatusError", 504),
+        ("CorruptedPayloadError", "JSONDecodeError", None),
+        ("NetworkPeeringError", "ConnectError", None),
+    )
+
+    print("Self-test samples:")
+    ok = True
+
+    for sample, (tree_class, cause_class, expected_code) in zip(
+        _SELF_TEST_SAMPLES, expectations
+    ):
+        obj = json.loads(sample)
+        valid, errors = validate_entry(obj)
+        codes = _extract_http_status_codes(obj)
+        tree = obj.get("exception_tree") or {}
+        cause = tree.get("cause") or {}
+
+        entry_ok = valid and tree.get("class") == tree_class
+        entry_ok = entry_ok and cause.get("class") == cause_class
+        if expected_code is not None:
+            entry_ok = (
+                entry_ok
+                and expected_code in codes
+                and _get_verb_seen(obj)
+            )
+        ok = ok and entry_ok
+
+        print(
+            f"  [{tree.get('class')} <- causa {cause.get('class')}] "
+            f"valid={valid} errors={errors}"
+        )
+        print(
+            f"    http_status_codes={codes} "
+            f"get_verb_seen={_get_verb_seen(obj)} -> "
+            f"{'OK' if entry_ok else 'FALLO'}"
+        )
+
     print(f"  Veredicto: {'OK' if ok else 'FALLO'}")
     return 0 if ok else 1
 

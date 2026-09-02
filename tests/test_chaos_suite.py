@@ -22,13 +22,14 @@ SOLVED in ``core.py`` by the ``_run_mission_with_capture`` wrapper
 returns as a sentinel value, so the re-raised ExceptionGroup is complete and
 every ``except*`` block whose class is present fires. A chaos run therefore
 surfaces ALL the concurrent incidents the current triggers produce —
-empirically three: the AWS timeout (ProviderTimeoutError) plus Azure 504 and
-GCP 422 (both NetworkPeeringError since FIX 2, commit 09be0d8). The
-``CORRUPTOS`` marker is deliberately NOT asserted (and asserted absent): FIX
-2 pointed the GCP trigger at ``httpbin.org/status/422`` instead of the
-plantilla's ``/xml`` endpoint, so chaos never produces a
-CorruptedPayloadError until issue I-04 restores that trigger on its owner
-lane.
+empirically three: the AWS timeout (ProviderTimeoutError) plus the Azure 504
+and GCP ``/xml`` pair (both CorruptedPayloadError). The GCP trigger is the
+plantilla's ``httpbin.org/xml`` (HTTP 200 with an XML body → ``response.json()``
+raises), and failed HTTP statuses / corrupt payloads both map to
+CorruptedPayloadError per the consigna's role texts (§2.2.1: "respuestas
+corruptas o estatus fallidos HTTP"; §2.2.2 prescribes ``raise
+CorruptedPayloadError(...) from error_nativo``). NetworkPeeringError remains
+DNS/routing-only and is exercised in test 9 via reserved ``*.invalid`` hosts.
 """
 from __future__ import annotations
 
@@ -44,13 +45,13 @@ import pytest
 from tests import validate_telemetry
 
 # Forensic markers emitted by the ``except*`` blocks in ``app_operator.py``.
-# ``CONEXION`` carries an accent in the real output ("CONEXIÓN"); we also
-# accept ``ROUTING`` which always co-occurs, so encoding hiccups never flake.
-# ``CORRUPT_MARKER`` is kept only for the divergence guard in test 2: chaos
-# must NOT produce it on this branch (see the note there and issue I-04).
+# ``CORRUPT_MARKER`` matches the corrupt/status header that groups the Azure
+# 504 and GCP /xml incidents (both CorruptedPayloadError under the consigna
+# role-text mapping §2.2.1/§2.2.2). A chaos run no longer produces the
+# DNS/CONEXIÓN header: NetworkPeeringError coverage lives in test 9, which
+# asserts the exception classes in-process against ``*.invalid`` hosts.
 TIMEOUT_MARKER = "TIMEOUTS"
-CORRUPT_MARKER = "CORRUPTOS"
-CONNECTION_MARKERS = ("CONEXIÓN", "ROUTING")
+CORRUPT_MARKER = "CORRUPTOS O ESTATUS HTTP FALLIDOS"
 
 VALID_CLUSTER = "cluster-us-east-01"
 CLI_TIMEOUT = 30  # seconds per subprocess
@@ -88,20 +89,23 @@ def test_chaos_mode_triggers_exceptions(run_cli, requires_network):
 
     The anti-fail-fast wrapper (``_run_mission_with_capture``) lets all three
     missions finish, so the ExceptionGroup re-raised to ``asyncio.run`` is
-    complete and both ``except*`` classes present in it fire: the AWS timeout
-    (ProviderTimeoutError -> TIMEOUTS header) and the Azure 504 + GCP 422
-    pair (both NetworkPeeringError since FIX 2 -> the CONEXIÓN/ROUTING header
-    reporting "2 incidentes"). We assert every marker the current triggers
-    actually produce, plus the forensic notes proving BOTH status codes
-    (504 and 422) reached the group — direct evidence for the consigna's
-    "fallos simultáneos agrupados y capturados quirúrgicamente".
+    complete and every ``except*`` class present in it fires: the AWS timeout
+    (ProviderTimeoutError -> TIMEOUTS header) and the Azure 504 + GCP ``/xml``
+    pair (both CorruptedPayloadError -> the corrupt/status header reporting
+    "2 incidentes").
 
-    ``CORRUPTOS`` is intentionally asserted ABSENT, not just ignored (issue
-    I-10/I-04 divergence): since FIX 2 the GCP chaos trigger is
-    ``httpbin.org/status/422`` (-> NetworkPeeringError), so chaos cannot
-    produce a CorruptedPayloadError on this branch. If I-04 ever restores
-    the plantilla's ``/xml`` trigger, flip these assertions (CORRUPTOS in,
-    the 422 note out). Exit code is 0 because ``except*`` contains it.
+    The GCP trigger is the plantilla's restored ``httpbin.org/xml`` endpoint:
+    HTTP 200 with an XML body, so ``response.json()`` raises a genuine
+    ``json.JSONDecodeError``. Both incident flavors map to
+    CorruptedPayloadError per the consigna's role texts — §2.2.1 defines it as
+    covering "respuestas corruptas o estatus fallidos HTTP" and §2.2.2
+    prescribes ``raise CorruptedPayloadError(...) from error_nativo`` for
+    ``httpx.HTTPStatusError`` — while NetworkPeeringError stays
+    DNS/routing-only (exercised in test 9). We assert every marker the
+    triggers produce plus the forensic notes proving both flavors reached the
+    group — direct evidence for the consigna's "fallos simultáneos agrupados
+    y capturados quirúrgicamente". Exit code is 0 because ``except*``
+    contains it.
     """
     result = run_cli("AWS", "Azure", "GCP", "-c", VALID_CLUSTER, "--chaos", "-t", "1.5")
 
@@ -112,23 +116,20 @@ def test_chaos_mode_triggers_exceptions(run_cli, requires_network):
     assert TIMEOUT_MARKER in combined, (
         f"expected '{TIMEOUT_MARKER}' in output\nstdout:\n{result.stdout}"
     )
-    # Transport/status incidents: Azure 504 + GCP 422 grouped in one header.
-    assert any(marker in combined for marker in CONNECTION_MARKERS), (
-        f"expected one of {CONNECTION_MARKERS} in output\nstdout:\n{result.stdout}"
+    # Corrupt/status incidents: Azure 504 + GCP /xml grouped in one header.
+    assert CORRUPT_MARKER in combined, (
+        f"expected '{CORRUPT_MARKER}' in output\nstdout:\n{result.stdout}"
     )
-    # Forensic notes: BOTH status-code incidents reached the group.
+    # Forensic note: the Azure 504 status reached the group — now under the
+    # corrupt/status header per the §2.2.1/§2.2.2 role-text mapping.
     assert "HTTP_Status_Code: 504" in combined, (
         "expected the Azure 504 forensic note in output\nstdout:\n" + result.stdout
     )
-    assert "HTTP_Status_Code: 422" in combined, (
-        "expected the GCP 422 forensic note in output\nstdout:\n" + result.stdout
-    )
-    # Divergence guard (I-04): no /xml trigger on this branch, so a chaos
-    # run must NOT report corrupted payloads.
-    assert CORRUPT_MARKER not in combined, (
-        f"chaos produced '{CORRUPT_MARKER}' — did I-04 restore the /xml "
-        f"trigger? Then update these assertions (422 note out, CORRUPTOS in)."
-        f"\nstdout:\n{result.stdout}"
+    # Forensic note: the GCP /xml corruption reached the group carrying its
+    # own Provider_ID/Endpoint/Content-Type context (the notes added together
+    # with the restored trigger so the incident produces FORENSE output).
+    assert "Provider_ID: GCP" in combined, (
+        "expected the GCP forensic note in output\nstdout:\n" + result.stdout
     )
 
 
@@ -383,7 +384,12 @@ def test_chaos_run_logs_exception_tree(run_cli, log_file):
         assert "asctime" not in entry, "asctime leaked into an exception entry"
 
     classes = {e["exception_tree"].get("class") for e in tree_entries}
-    assert classes & {"ProviderTimeoutError", "NetworkPeeringError"}, (
+    # Online, a chaos run surfaces ProviderTimeoutError (AWS /delay/3) plus
+    # CorruptedPayloadError (Azure 504 + GCP /xml per §2.2.1/§2.2.2); offline
+    # (httpbin unreachable) every mission collapses into NetworkPeeringError
+    # via httpx.RequestError — the DNS path. The intersection keeps the
+    # assertion valid in both worlds.
+    assert classes & {"ProviderTimeoutError", "CorruptedPayloadError", "NetworkPeeringError"}, (
         f"expected chaos-triggered exception classes in the tree, got {classes}"
     )
 
