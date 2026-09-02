@@ -195,6 +195,62 @@ class PreservingQueueHandler(logging.handlers.QueueHandler):
 
 
 # ============================================================
+# CONSOLE FORMATTER
+# ============================================================
+
+# Línea única que reemplaza al traceback crudo en consola: el árbol
+# forense completo (exception_tree + stack_trace) persiste únicamente
+# en el log JSON (triton_services.log).
+TRACEBACK_OMITIDO = (
+    "[traceback omitido en consola — "
+    "árbol forense completo en triton_services.log]"
+)
+
+CONSOLE_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+CONSOLE_DATEFMT = "%H:%M:%S"
+
+
+class ConsoleFormatter(logging.Formatter):
+    """
+    Formatter de consola que omite los tracebacks crudos.
+
+    ``formatException()`` devuelve una única línea informativa en
+    lugar del traceback multi-línea, de modo que la consola del
+    operador queda legible. El ``RotatingFileHandler`` (con
+    ``AsyncJSONFormatter``) sigue persistiendo el árbol forense
+    completo — ``exception_tree`` y ``stack_trace`` — en
+    ``triton_services.log``.
+
+    Solo cambia el render de consola: la propagación de ``exc_info``
+    a través de la cola (``PreservingQueueHandler``) y el pipeline
+    JSON permanecen intactos.
+    """
+
+    def __init__(
+        self,
+        format: str = CONSOLE_FORMAT,
+        datefmt: str = CONSOLE_DATEFMT,
+    ) -> None:
+
+        # ``format`` (en lugar de ``fmt``) refleja el nombre de la clave
+        # declarativa del esquema dictConfig, que inyecta las claves
+        # restantes como kwargs al callable custom (rol del Integrante 5
+        # §2.2.5); acá se traduce al parámetro canónico ``fmt`` de
+        # logging.Formatter. Las constantes de módulo quedan como defaults.
+        super().__init__(
+            fmt=format,
+            datefmt=datefmt,
+        )
+
+    def formatException(self, exc_info) -> str:
+        """
+        Reemplaza el traceback crudo por la línea de omisión.
+        """
+
+        return TRACEBACK_OMITIDO
+
+
+# ============================================================
 # JSON FORMATTER
 # ============================================================
 
@@ -538,13 +594,12 @@ def setup_triton_logging(
             },
 
             "console_clean": {
-                "format": (
-                    "%(asctime)s "
-                    "[%(levelname)s] "
-                    "[%(name)s] "
-                    "%(message)s"
-                ),
-                "datefmt": "%H:%M:%S",
+                # Formatter de consola custom: declarativo como el resto del esquema
+                # (rol del Integrante 5 §2.2.5: dictConfig declarativo completo),
+                # omite tracebacks crudos en consola pero mantiene el prefijo estándar.
+                "()": ConsoleFormatter,
+                "format": CONSOLE_FORMAT,
+                "datefmt": CONSOLE_DATEFMT,
             },
         },
 
