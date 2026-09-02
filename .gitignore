@@ -40,3 +40,6 @@ Thumbs.db
 
 # Local logs
 *.log
+
+# Local-only project documentation (untracked by team decision)
+CHANGELOG.md
