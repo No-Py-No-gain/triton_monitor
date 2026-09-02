@@ -135,7 +135,10 @@ async def async_main():
                 
     except* CorruptedPayloadError as group:
         # Captura Quirúrgica 2: Mitigar códigos de error HTTP de forma lógica sin detener el programa
-        logger.error(f"\n  ADVERTENCIA: RECIBIDOS PAYLOADS DE TELEMETRÍA CORRUPTOS ({len(group.exceptions)} incidentes):")
+        # Patrón de plantilla §4.3: prefijo ADVERTENCIA con doble espacio;
+        # el texto extendido "O ESTATUS HTTP FALLIDOS" refleja el mapeo
+        # §2.2.2 (estatus HTTP → CorruptedPayloadError).
+        logger.error(f"\n  ADVERTENCIA: RECIBIDOS PAYLOADS DE TELEMETRÍA CORRUPTOS O ESTATUS HTTP FALLIDOS ({len(group.exceptions)} incidentes):")
         for exc in group.exceptions:
             logger.error(f"   Fallo: {exc}", exc_info=exc)
             for note in getattr(exc, "__notes__", []):
@@ -151,9 +154,11 @@ async def async_main():
                 
     except* TritonError as group:
         # Captura Quirúrgica 4: Fallos genéricos de Tritón no catalogados
-        logger.error(f"\n DETECTADO ERROR OPERACIONAL IMPREVISTO EN ECOSISTEMA TRITÓN:")
+        logger.error("\n DETECTADO ERROR OPERACIONAL IMPREVISTO EN ECOSISTEMA TRITÓN:")
         for exc in group.exceptions:
             logger.error(f"   Fallo: {exc}", exc_info=exc)
+            for note in getattr(exc, "__notes__", []):
+                logger.error(f"     └─ [FORENSE TRITÓN] {note}")
 
     finally:
         # PEP 765 / Python 3.14: finally solo se usa para liberar descriptores y hilos
