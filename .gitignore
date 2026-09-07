@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -26,6 +27,8 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+.atl/
+docs/
 
 # OS files
 .DS_Store
@@ -37,3 +40,6 @@ Thumbs.db
 
 # Local logs
 *.log
+
+# Local-only project documentation (untracked by team decision)
+CHANGELOG.md

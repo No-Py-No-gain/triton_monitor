@@ -13,10 +13,10 @@ class ProviderTimeoutError(TritonError):
 
 
 class CorruptedPayloadError(TritonError):
-    """Lanzada cuando la respuesta recibida del proveedor cloud no cumple con el formato o está corrupta."""
+    """Lanzada cuando la respuesta recibida del proveedor cloud es corrupta, no serializable o corresponde a un estatus HTTP fallido (4xx/5xx)."""
     pass
 
 
 class NetworkPeeringError(TritonError):
-    """Lanzada cuando existen fallos de resolución de DNS, ruteo o denegación de conexión física (e.g., 4xx, 5xx)."""
+    """Lanzada cuando existen fallos de resolución de DNS, ruteo o denegación de conexión física."""
     pass
