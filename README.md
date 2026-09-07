@@ -1,5 +1,7 @@
 # TritonMonitor — Sistema de Telemetría Multicloud y Observabilidad Asíncrona (Proyecto Tritón)
 
+[Link al Drive de la explicación del código](https://drive.google.com/drive/folders/1A0TZGgoAJ9iefU1pgYPtQTmvEpK0TiJc?usp=sharing)
+
 Trabajo Práctico 1 — Proyecto Tritón.
 
 `triton_monitor` es el monitor CLI oficial del escenario **Proyecto Tritón**: la corporación *Triton Cloud Services* opera clústeres de cómputo críticos distribuidos simultáneamente en tres proveedores de nube (AWS, Azure y GCP) y, durante tormentas de radiación electromagnética, sus nodos de telemetría sufren en paralelo colapsos físicos de red, pérdidas de peering y corrupciones graves de datos. El sistema consulta **APIs HTTP reales** de forma asíncrona y concurrente (un `httpx.AsyncClient` compartido dentro de un `asyncio.TaskGroup`), traduce cada error nativo de red a una excepción semántica de dominio (`TritonError` y sus subclases), agrupa los fallos simultáneos en un `ExceptionGroup` capturado de forma quirúrgica con `except*`, y persiste la telemetría como **JSON estructurado** (timestamp ISO 8601 UTC) mediante un pipeline de logging **no bloqueante** con rotación acotada y compresión gzip. El resultado cumple el requisito central de resiliencia de la consigna: ningún fallo asíncrono o de conexión HTTP real provoca el cierre abrupto de la aplicación.
